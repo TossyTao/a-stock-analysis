@@ -716,13 +716,10 @@ def test_geopolitical_risk_strategic_resource():
 
 
 def test_geopolitical_risk_none():
-    """无风险敞口:普通消费行业不命中。"""
-    r = classify_geopolitical_risk("食品饮料", "海天味业")
-    # 海天味业是消费,可能命中 consumer_policy,验证脚本会识别
-    # 测试一个完全不命中的:纺织服装
-    r2 = classify_geopolitical_risk("纺织服装", "XX服饰")
-    assert r2["has_risk"] is False
-    assert r2["risk_types"] == []
+    """无风险敞口:普通公用事业行业不命中任何风险。"""
+    r = classify_geopolitical_risk("公用事业/水务", "XX水务")
+    assert r["has_risk"] is False
+    assert r["risk_types"] == []
     print(f"✅ test_geopolitical_risk_none passed")
 
 
@@ -741,6 +738,78 @@ def test_geopolitical_risk_in_analyze_fundamental():
     assert r["geopolitical_risk"]["has_risk"] is True
     assert any(rt["id"] == "sanction" for rt in r["geopolitical_risk"]["risk_types"])
     print(f"✅ test_geopolitical_risk_in_analyze_fundamental passed (risks: {[rt['id'] for rt in r['geopolitical_risk']['risk_types']]})")
+
+
+def test_geopolitical_risk_overseas_business_power_equipment():
+    """海外业务风险:电力设备(输配电)识别为 overseas_business。"""
+    r = classify_geopolitical_risk("电力设备(输配电一次设备)", "思源电气")
+    assert r["has_risk"] is True
+    ids = [rt["id"] for rt in r["risk_types"]]
+    assert "overseas_business" in ids
+    print(f"✅ test_geopolitical_risk_overseas_business_power_equipment passed (risks: {ids})")
+
+
+def test_geopolitical_risk_overseas_business_construction_machinery():
+    """海外业务风险:工程机械识别为 overseas_business。"""
+    r = classify_geopolitical_risk("工程机械", "三一重工")
+    assert r["has_risk"] is True
+    assert any(rt["id"] == "overseas_business" for rt in r["risk_types"])
+    print(f"✅ test_geopolitical_risk_overseas_business_construction_machinery passed")
+
+
+def test_geopolitical_risk_overseas_business_home_appliance():
+    """海外业务风险:家电(白电)识别为 overseas_business。"""
+    r = classify_geopolitical_risk("白色家电", "海尔智家")
+    assert r["has_risk"] is True
+    assert any(rt["id"] == "overseas_business" for rt in r["risk_types"])
+    print(f"✅ test_geopolitical_risk_overseas_business_home_appliance passed")
+
+
+def test_roic_stability_seasonal_adjustment():
+    """季节性调整:有年度数据(period 末尾 1231)时优先用年度数据算 cv。"""
+    # 8 期季度数据,Q4 回款季节性导致 ROIC 大幅波动
+    roics = [0.05, 0.02, 0.03, 0.15, 0.06, 0.02, 0.04, 0.16]
+    periods = ["20210331", "20210630", "20210930", "20211231",
+               "20220331", "20220630", "20220930", "20221231"]
+    r = compute_roic_stability(roics, periods)
+    assert r["available"] is True
+    assert r["seasonal_adjusted"] is True
+    # 只用了 2 期年度数据(20211231, 20221231)
+    assert len(r["values"]) == 2
+    assert r["used_periods"] == ["20211231", "20221231"]
+    # 年度数据 cv 应远小于季度数据 cv
+    print(f"✅ test_roic_stability_seasonal_adjustment passed (cv={r['cv']}, periods={r['used_periods']})")
+
+
+def test_roic_stability_no_periods_fallback():
+    """无 periods 时退化为原逻辑(全部数据),seasonal_adjusted=False。"""
+    r = compute_roic_stability([0.15, 0.16, 0.17])
+    assert r["available"] is True
+    assert r["seasonal_adjusted"] is False
+    assert r["used_periods"] is None
+    assert len(r["values"]) == 3
+    print(f"✅ test_roic_stability_no_periods_fallback passed")
+
+
+def test_roic_stability_only_quarterly_no_annual():
+    """只有季度数据(无 1231 期)时退化为原逻辑。"""
+    roics = [0.05, 0.02, 0.03]
+    periods = ["20210331", "20210630", "20210930"]
+    r = compute_roic_stability(roics, periods)
+    assert r["available"] is True
+    assert r["seasonal_adjusted"] is False
+    assert len(r["values"]) == 3
+    print(f"✅ test_roic_stability_only_quarterly_no_annual passed")
+
+
+def test_siyuan_industry_fallback():
+    """思源电气 002028 行业映射兜底:电力设备(输配电一次设备)。"""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from fetch_data import _fetch_industry_fallback
+    ind = _fetch_industry_fallback("002028")
+    assert "电力设备" in ind
+    assert "输配电" in ind
+    print(f"✅ test_siyuan_industry_fallback passed (industry: {ind})")
 
 
 if __name__ == "__main__":
@@ -807,4 +876,11 @@ if __name__ == "__main__":
     test_geopolitical_risk_strategic_resource()
     test_geopolitical_risk_none()
     test_geopolitical_risk_in_analyze_fundamental()
+    test_geopolitical_risk_overseas_business_power_equipment()
+    test_geopolitical_risk_overseas_business_construction_machinery()
+    test_geopolitical_risk_overseas_business_home_appliance()
+    test_roic_stability_seasonal_adjustment()
+    test_roic_stability_no_periods_fallback()
+    test_roic_stability_only_quarterly_no_annual()
+    test_siyuan_industry_fallback()
     print("\n🎉 All tests passed!")

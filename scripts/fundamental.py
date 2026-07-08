@@ -63,9 +63,11 @@ GROWTH_NARRATIVES = {
         "growth_potential": "成长性强(若管线兑现)",
     },
     "high_end_manufacturing": {
-        "keywords": ["数控机床", "工业软件", "高端装备", "航空航天"],
-        "narrative": "高端制造升级(进口替代 + 出海)",
-        "growth_potential": "成长性中等(传统制造向高端升级)",
+        "keywords": ["数控机床", "工业软件", "高端装备", "航空航天",
+                     "电力设备", "输配电", "电网", "特高压", "智能电网",
+                     "新型电力系统", "海外电网", "工程机械", "叉车"],
+        "narrative": "高端制造升级(进口替代 + 出海 + 电网投资)",
+        "growth_potential": "成长性中等(传统制造向高端升级 + 海外业务扩张)",
     },
 }
 
@@ -79,6 +81,15 @@ GEOPOLITICAL_RISK_TYPES = {
         "description": "海外矿山/油气田所在国政局动荡、国有化、税收政策变化、内战冲突",
         "examples": "紫金矿业(塞尔维亚/刚果金/苏里南)、赣锋锂业(墨西哥/阿根廷)、中海油(海外油气)、洛阳钼业(刚果金)",
         "verification": "查最新新闻:资源国政局/政策/冲突;查公告:海外资产减值/税收变化",
+    },
+    "overseas_business": {
+        "keywords": ["电力设备", "输配电", "电网", "工程机械", "家电", "白色家电",
+                     "黑电", "海外工程", "国际工程", "出海", "海外业务", "港口机械",
+                     "叉车", "客车", "重卡", "纺织服装", "鞋服", "消费电子出海"],
+        "risk": "海外业务地缘/汇率风险",
+        "description": "海外业务占比高,面临汇率波动、贸易摩擦、海外项目政治风险、客户所在国政策变化",
+        "examples": "思源电气(欧洲电网改造订单)、三一重工(海外工程机械)、海尔智家(全球白电)、宇通客车(海外客车)",
+        "verification": "查最新新闻:汇率波动/贸易摩擦/海外项目履约;查公告:海外业务占比/汇率影响/海外子公司",
     },
     "sanction": {
         "keywords": ["半导体", "芯片", "EDA", "光刻", "刻蚀", "AI算力", "GPU",
@@ -190,11 +201,32 @@ def classify_geopolitical_risk(industry: str, name: str = "") -> Dict[str, Any]:
     }
 
 
-def compute_roic_stability(roics: List[float]) -> Dict[str, Any]:
-    """ROIC 稳定性:均值、标准差、变异系数。"""
-    valid = [r for r in roics if r is not None]
+def compute_roic_stability(roics: List[float], periods: List[str] = None) -> Dict[str, Any]:
+    """ROIC 稳定性:均值、标准差、变异系数。
+
+    若提供 periods,优先用年度数据(period 末尾为 '1231')算 cv,避免季度季节性失真。
+    电力设备、电网、工程机械等季节性行业 Q4 集中回款,季度 ROIC 波动天然大,
+    用季度数据算 cv 会高估不稳定性,误判为周期股。
+    """
+    if periods and len(periods) == len(roics):
+        annual_pairs = [(str(p), r) for p, r in zip(periods, roics)
+                        if r is not None and str(p).endswith("1231")]
+        if len(annual_pairs) >= 2:
+            valid = [r for _, r in annual_pairs]
+            used_periods = [p for p, _ in annual_pairs]
+            seasonal_adjusted = True
+        else:
+            valid = [r for r in roics if r is not None]
+            used_periods = None
+            seasonal_adjusted = False
+    else:
+        valid = [r for r in roics if r is not None]
+        used_periods = None
+        seasonal_adjusted = False
+
     if len(valid) < 2:
-        return {"available": False, "mean": None, "std": None, "cv": None, "trend": None}
+        return {"available": False, "mean": None, "std": None, "cv": None, "trend": None,
+                "seasonal_adjusted": seasonal_adjusted}
     mean = statistics.mean(valid)
     std = statistics.stdev(valid)
     cv = abs(std / mean) if mean != 0 else float("inf")
@@ -214,6 +246,8 @@ def compute_roic_stability(roics: List[float]) -> Dict[str, Any]:
         "cv": round(cv, 4),
         "trend": trend,
         "values": valid,
+        "seasonal_adjusted": seasonal_adjusted,
+        "used_periods": used_periods,
     }
 
 
@@ -625,8 +659,9 @@ def analyze_fundamental(
     margins = [_safe_float(f.get("gross_margin_pct")) for f in financials]
     revenues = [_safe_float(f.get("revenue")) for f in financials]
     operating_profits = [_safe_float(f.get("operating_profit")) for f in financials]
+    periods = [str(f.get("period", "")) for f in financials]
 
-    roic_stability = compute_roic_stability(roics)
+    roic_stability = compute_roic_stability(roics, periods)
     profit_growth = compute_profit_growth(profits)
     fcf_quality = compute_fcf_quality(fcfs, profits)
     gross_margin = compute_gross_margin_trend(margins)
