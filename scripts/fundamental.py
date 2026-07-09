@@ -23,9 +23,50 @@ import statistics
 
 CYCLICAL_INDUSTRIES = {
     "钢铁", "有色金属", "煤炭", "化工", "建筑材料", "机械", "房地产",
-    "银行", "证券", "保险", "航运", "航空", "造纸", "纺织服装",
+    "证券", "保险", "航运", "航空", "造纸", "纺织服装",
     "石油石化", "基础化学", "农药兽药",
+    # 注意:银行从 CYCLICAL 移除,改走 bank_quality 专用路径
 }
+
+# 银行股识别:A 股主要银行股代码(国有大行 + 股份制 + 城商行)
+BANK_CODES = {
+    "600036",  # 招商银行
+    "601398",  # 工商银行
+    "601939",  # 建设银行
+    "601288",  # 农业银行
+    "601988",  # 中国银行
+    "601328",  # 交通银行
+    "600000",  # 浦发银行
+    "600016",  # 民生银行
+    "600015",  # 华夏银行
+    "600011",  # 照片银行(原 600011 为华能国际,此处应为 600015 华夏)
+    "601166",  # 兴业银行
+    "601818",  # 光大银行
+    "601998",  # 中信银行
+    "601009",  # 南京银行
+    "601169",  # 北京银行
+    "601229",  # 上海银行
+    "601577",  # 长沙银行
+    "601838",  # 成都银行
+    "601916",  # 浙商银行
+    "002142",  # 宁波银行
+    "002839",  # 张家港行
+    "002936",  # 郑州银行
+    "002948",  # 青岛银行
+    "002958",  # 青农商行
+    "6066",    # 重庆银行(H)
+}
+
+
+def is_bank(industry: str, code: str = "", name: str = "") -> bool:
+    """识别银行股:行业含'银行'或代码在 BANK_CODES。"""
+    if industry and "银行" in industry:
+        return True
+    if code and code in BANK_CODES:
+        return True
+    if name and "银行" in name:
+        return True
+    return False
 
 GROWTH_INDUSTRIES = {
     "医药生物", "医疗器械", "食品饮料", "电子", "半导体", "计算机",
@@ -625,6 +666,145 @@ def investment_approach(stock_type: str) -> Dict[str, Any]:
     return approaches.get(stock_type, approaches["待定"])
 
 
+def analyze_bank_quality(
+    code: str,
+    name: str,
+    industry: str,
+    pe: Optional[float],
+    pb: Optional[float],
+    financials: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """银行股专用分析:用 ROE 替代 ROIC,PB/股息率替代 PE。
+
+    银行股特殊性:
+    - 不适用 ROIC(资本结构不同,银行无"投入资本"概念)
+    - 不适用 FCF/NI(经营现金流本身就是业务)
+    - 不适用 PE 陷阱(银行低 PE 是常态,非顶部信号)
+    - 估值锚是 PB + 股息率,而非 PE
+
+    银行类型判定:
+    - 成长(优质银行):ROE 稳定 > 12% + 利润持续正增长 + 不良率稳定
+    - 周期(普通银行):ROE 波动大 + 利润负增长
+
+    核心指标(从 sina 摘要可获取):
+    - ROE(净资产收益率)- 替代 ROIC
+    - ROA(总资产报酬率)
+    - 资产负债率(银行普遍 > 90%,差异小)
+    - 净息差/不良率/拨备率 - sina 摘要无,需查年报附注
+    """
+    if financials and len(financials) >= 2:
+        first_p = str(financials[0].get("period", ""))
+        last_p = str(financials[-1].get("period", ""))
+        if first_p > last_p:
+            financials = list(reversed(financials))
+
+    roes = [_safe_float(f.get("roe")) for f in financials]
+    profits = [_safe_float(f.get("net_profit")) for f in financials]
+    revenues = [_safe_float(f.get("revenue")) for f in financials]
+    periods = [str(f.get("period", "")) for f in financials]
+
+    roe_stability = compute_roic_stability(roes, periods)  # 复用,语义是 ROE
+    profit_growth = compute_profit_growth(profits)
+    revenue_growth = compute_revenue_growth(revenues)
+
+    # 银行类型判定:ROE 稳定性 + 利润增长
+    roe_mean = roe_stability.get("mean")
+    roe_cv = roe_stability.get("cv")
+    roe_available = roe_stability.get("available")
+
+    bank_type = "待定"
+    evidence = ["银行股,走专用分析路径(ROE 替代 ROIC,PB 替代 PE)"]
+
+    if roe_available and roe_mean is not None:
+        evidence.append(f"ROE 均值 {roe_mean:.2f}%")
+        if roe_cv is not None:
+            evidence.append(f"ROE cv {roe_cv:.2f}")
+        # ROE > 12% 且 cv < 0.3 = 优质银行
+        if roe_mean > 12 and (roe_cv is None or roe_cv < 0.3):
+            bank_type = "成长(优质银行)"
+            evidence.append("ROE 高且稳定,符合优质银行特征(如招行/宁波)")
+        elif roe_mean > 10:
+            bank_type = "周期(普通银行)"
+            evidence.append("ROE 中等,普通银行")
+        else:
+            bank_type = "周期(弱质银行)"
+            evidence.append("ROE 偏低,经营压力大")
+
+    if profit_growth.get("available"):
+        if profit_growth.get("all_positive"):
+            evidence.append("利润持续正增长")
+        else:
+            evidence.append(f"利润波动大(min {profit_growth.get('min_rate')}, max {profit_growth.get('max_rate')})")
+
+    # 银行估值锚:PB + 股息率(非 PE)
+    pe_trap = {
+        "available": pb is not None,
+        "warning": None,
+        "interpretation": (
+            f"银行股估值锚为 PB = {pb}(当前)"
+            if pb is not None
+            else "银行股估值锚为 PB + 股息率(PE 不适用),PB 数据缺失"
+        ),
+        "pb": pb,
+        "valuation_anchor": "PB + 股息率",
+        "note": "银行低 PE 是常态非顶部信号;PB<1 + ROE>12% = 低估;股息率>4% = 高息配置价值",
+    }
+
+    # 投资思路
+    if "成长" in bank_type:
+        approach = {
+            "approach": "长期持有(优质银行)",
+            "rationale": "ROE 高且稳定,零售/对公护城河,长期复利",
+            "action": "逢低加仓,PB<1 时重点配置;长期持有吃股息,不轻易波段",
+        }
+    elif "普通" in bank_type:
+        approach = {
+            "approach": "波段操作(普通银行)",
+            "rationale": "ROE 中等,跟随经济周期和息差周期",
+            "action": "PB<0.7 低估布局,PB>1 减仓;关注息差/不良率拐点",
+        }
+    else:
+        approach = {
+            "approach": "观望(弱质银行)",
+            "rationale": "ROE 偏低,经营压力或风险暴露",
+            "action": "不建议配置,等基本面改善",
+        }
+
+    geopolitical_risk = {
+        "has_risk": True,
+        "risk_types": [
+            {
+                "id": "bank_policy",
+                "risk": "政策依赖(银行专用)",
+                "description": "LPR 下行压息差、准备金率调整、房地产敞口风险、地方债风险暴露、利率市场化",
+                "examples": "招行(房地产+零售信用)、工行(对公+地方债)",
+                "verification": "查最新:LPR 变化、季度净息差、不良贷款率、拨备覆盖率、房地产敞口",
+            }
+        ],
+        "note": "银行股天然受政策强烈影响,需跟踪息差/不良/房地产",
+    }
+
+    return {
+        "code": code,
+        "name": name,
+        "industry": industry or "银行",
+        "pe": pe,
+        "pb": pb,
+        "is_bank": True,
+        "classification": {
+            "type": bank_type,
+            "evidence": evidence,
+            "roe_stability": roe_stability,
+            "profit_growth": profit_growth,
+            "revenue_growth": revenue_growth,
+            "note": "银行股专用分析,不适用 ROIC/FCF/PE 陷阱框架",
+        },
+        "pe_trap": pe_trap,
+        "investment_approach": approach,
+        "geopolitical_risk": geopolitical_risk,
+    }
+
+
 def analyze_fundamental(
     code: str,
     name: str,
@@ -640,7 +820,13 @@ def analyze_fundamental(
 
     时间顺序:financials 按时间正序(旧 -> 新)传入,最新一期在 financials[-1]。
     若上游(sina)返回的是倒序(新 -> 旧),会自动检测并 reverse。
+
+    银行股走专用路径(analyze_bank_quality),不适用 ROIC/FCF/PE 陷阱框架。
     """
+    # 银行股分流:用 ROE 替代 ROIC,PB/股息率替代 PE
+    if is_bank(industry, code, name):
+        return analyze_bank_quality(code, name, industry, pe, pb, financials)
+
     industry_info = classify_by_industry(industry)
     narrative_info = classify_by_narrative(industry, name)
     geopolitical_risk = classify_geopolitical_risk(industry, name)
