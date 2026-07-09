@@ -68,6 +68,54 @@ def is_bank(industry: str, code: str = "", name: str = "") -> bool:
         return True
     return False
 
+
+# 半导体行业识别关键词
+SEMICONDUCTOR_INDUSTRY_KEYWORDS = [
+    "半导体", "集成电路", "芯片", "EDA", "封测", "晶圆", "光刻",
+    "功率半导体", "第三代半导体", "MCU", "SoC", "CIS", "IGBT",
+    "SiC", "GaN", "MEMS", "传感器", "半导体设备", "半导体材料",
+    "光刻胶", "电子特气", "靶材", "硅片", "化合物半导体",
+    "模拟芯片", "数字芯片", "射频芯片", "电源管理芯片",
+]
+
+# 半导体公司名称关键词(覆盖 A 股主要半导体公司)
+SEMICONDUCTOR_NAME_KEYWORDS = [
+    "中芯", "华虹", "长电", "通富", "华大九天", "北方华创", "中微",
+    "沪硅", "立昂微", "斯达", "士兰微", "紫光国微", "韦尔",
+    "兆易", "圣邦", "卓胜微", "思瑞浦", "纳芯微", "宏微", "东微",
+    "扬杰", "新洁能", "华润微", "晶晨", "瑞芯微", "全志", "北京君正",
+    "寒武纪", "海光", "龙芯", "澜起", "江丰电子", "有研新材",
+    "雅克科技", "安集科技", "鼎龙股份", "上海新阳", "华特气体",
+    "金宏气体", "南大光电", "气派科技", "太极实业", "华天科技",
+    "晶方科技", "环旭电子", "长川科技", "精测电子", "至纯科技",
+    "芯源微", "盛美上海", "华峰测控", "概伦电子", "广立微",
+    "拓荆科技", "微导纳米", "芯碁微装", "中巨芯", "鼎泰科分",
+    "振华风光", "紫光股份", "复旦微", "安路科技", "峰岹科技",
+    "晶合集成", "芯动联科", "慧智微", "钜泉科技", "帝奥微",
+    "美芯晟", "龙迅股份", "艾为电子", "希荻微", "必易微",
+    "杰华特", "天岳先进", "东尼电子", "天合光能",
+]
+
+
+def is_semiconductor(industry: str, code: str = "", name: str = "") -> bool:
+    """识别半导体行业:行业关键词或公司名称关键词。
+
+    半导体行业特殊性:
+    - 受周期 + 技术迭代 + 制裁/国产替代叙事三重影响
+    - 财务数据严重滞后(季报间隔长),利润波动大
+    - 股票驱动以短期量价 + 主题叙事 + 制裁政策为主,而非财务数据
+    - 需用短期(5/10/20 日)筹码+量价为主判断,弱化长期基本面
+    """
+    if industry:
+        ind = str(industry)
+        if any(kw in ind for kw in SEMICONDUCTOR_INDUSTRY_KEYWORDS):
+            return True
+    if name:
+        nm = str(name)
+        if any(kw in nm for kw in SEMICONDUCTOR_NAME_KEYWORDS):
+            return True
+    return False
+
 GROWTH_INDUSTRIES = {
     "医药生物", "医疗器械", "食品饮料", "电子", "半导体", "计算机",
     "软件开发", "互联网服务", "通信", "消费电子", "生物制品",
@@ -1330,6 +1378,36 @@ def analyze_fundamental(
             "divergence": research_report.get("divergence"),
         }
 
+    # 半导体行业特殊处理:弱化长期基本面,突出短期量价筹码
+    semiconductor_handling = None
+    if is_semiconductor(industry, code, name):
+        semiconductor_handling = build_semiconductor_handling(
+            industry=industry, name=name, code=code,
+            pe=pe, pb=pb,
+            roe_stability=roe_stability, dupont=dupont,
+            buffett=buffett, fake_roe=fake_roe,
+            classification_type=classification.get("type"),
+            geopolitical_risk=geopolitical_risk,
+        )
+        # 半导体行业改写投资思路:短期为主,基本面为辅
+        approach = {
+            "approach": "半导体行业:短期量价筹码为主,基本面为辅",
+            "rationale": (
+                "半导体行业受周期 + 技术迭代 + 制裁/国产替代叙事三重影响,"
+                "财务数据严重滞后且利润波动大,ROE/PE 陷阱/巴菲特标准易误判。"
+                "以 5/10/20 日筹码 + 量价趋势为主判断,基本面仅作参考。"
+            ),
+            "action": (
+                "核心看:① 5/10/20 日筹码主峰迁移 + 集中度变化 "
+                "② 5/10/20 日量价趋势 + 加速度 "
+                "③ 五步核对 + 量价背离 + 主力骗局 "
+                "④ 制裁/国产替代政策兑现程度(查最新新闻)。"
+                "基本面(ROE/PE/杜邦)仅作辅助,不作为决策依据。"
+            ),
+        }
+        # 在 evidence 加入半导体特殊处理提示
+        classification["evidence"] = semiconductor_handling["evidence"] + classification.get("evidence", [])
+
     return {
         "code": code,
         "name": name,
@@ -1347,4 +1425,95 @@ def analyze_fundamental(
             "fake_roe": fake_roe,
         },
         "research_report": research_report,
+        "semiconductor_handling": semiconductor_handling,
+    }
+
+
+def build_semiconductor_handling(
+    industry: str, name: str, code: str,
+    pe: Optional[float], pb: Optional[float],
+    roe_stability: Dict, dupont: Dict,
+    buffett: Dict, fake_roe: Dict,
+    classification_type: str,
+    geopolitical_risk: Dict,
+) -> Dict[str, Any]:
+    """半导体行业特殊处理:标注基本面可信度 + 政治风险 + 短期信号优先级。
+
+    半导体行业不能用 ROE/PE 陷阱/巴菲特三步判断,因为:
+    - 高研发投入期利润负,ROE 偏低 ≠ 基本面差
+    - PE 极高或负 ≠ 见顶(成长期常态)
+    - 巴菲特三步(ROE>15% + 低负债 + 现金流匹配)对半导体过严
+    """
+    evidence: List[str] = []
+
+    # 基本面降级提示
+    evidence.append("⚠️ 半导体行业:基本面权重降级 - ROE/PE 陷阱/巴菲特标准仅作参考,不作决策依据")
+
+    # ROE 解读(半导体允许低 ROE)
+    if roe_stability.get("available"):
+        mean = roe_stability.get("mean")
+        if mean is not None and mean < 12:
+            evidence.append(
+                f"半导体 ROE {mean}% 偏低,但不代表基本面差(高研发投入期 + 行业周期低谷常态)"
+            )
+
+    # PE 解读(半导体允许高 PE 或亏损)
+    if pe is not None:
+        if pe > 100 or pe < 0:
+            evidence.append(
+                f"半导体 PE {pe} 极高或为负,属成长期常态,不能用 PE 陷阱框架判断"
+            )
+
+    # 假高 ROE 警告对半导体意义不大
+    if fake_roe.get("is_fake"):
+        evidence.append("假高 ROE 警告对半导体意义有限(财务波动大,信号噪音高)")
+
+    # 制裁/国产替代政治风险(半导体关键)
+    geo = geopolitical_risk or {}
+    has_sanction = any(
+        rt.get("id") == "sanction" for rt in geo.get("risk_types", [])
+    )
+    if has_sanction:
+        evidence.append("⚠️ 半导体核心风险:美国制裁(ECCN 实体清单/EDA 出口管制/先进制程设备限制)- 需查最新新闻核查兑现程度")
+    else:
+        # 半导体行业但脚本未识别制裁风险,手动提示
+        evidence.append("⚠️ 半导体核心风险:美国制裁(脚本未自动识别,需手动核查实体清单 + EDA/设备出口管制 + 先进制程限制)")
+
+    # 国产替代叙事(反向受益)- 半导体行业直接认定有国产替代叙事
+    narrative = classify_by_narrative(industry or "半导体", name)
+    has_domestic_sub = any(n.get("id") == "domestic_substitution" for n in narrative.get("narratives", []))
+    if has_domestic_sub:
+        ev_narr = "国产替代叙事:政策驱动 + 美国制裁反向加速国产化(反向受益)"
+    else:
+        # 半导体行业但 classify_by_narrative 未识别,手动认定
+        ev_narr = "国产替代叙事:半导体行业天然受国产替代驱动(政策驱动 + 美国制裁反向加速国产化)"
+    evidence.append(ev_narr)
+
+    # 短期信号优先级
+    evidence.append("🎯 决策优先级:5/10/20 日筹码对比 + 量价趋势 > 五步核对 > 政治风险兑现 > 基本面")
+
+    return {
+        "is_semiconductor": True,
+        "industry": industry,
+        "name": name,
+        "code": code,
+        "fundamental_weight": "low",
+        "short_term_weight": "high",
+        "note": (
+            "半导体行业:短期量价筹码为主,基本面为辅。"
+            "ROE/PE 陷阱/巴菲特标准仅作参考,不作决策依据。"
+        ),
+        "key_risks": [
+            "美国制裁(ECCN 实体清单/EDA 出口管制/先进制程设备限制)",
+            "技术迭代跟不上(制程落后 = 失去客户)",
+            "周期低谷(存储/模拟芯片周期性强)",
+            "国产替代叙事破灭(技术无法突破)",
+        ],
+        "key_catalysts": [
+            "国产替代订单兑现(Q2/Q3 营收 + 扣非持续增长)",
+            "制裁反向受益(被制裁方受损但国产替代方受益)",
+            "大基金持股变化(增持/减持)",
+            "AI 算力需求溢出(先进封装/HBM 等需求)",
+        ],
+        "evidence": evidence,
     }

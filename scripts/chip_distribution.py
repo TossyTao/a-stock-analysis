@@ -39,8 +39,8 @@ def compute_chip_distribution(
 
     返回 (bins, chip, meta),meta 包含 decay_mode / avg_turnover 等信息。
     """
-    if len(daily) < 20:
-        raise ValueError(f"数据不足: {len(daily)} < 20")
+    if len(daily) < 5:
+        raise ValueError(f"数据不足: {len(daily)} < 5")
 
     df = pd.DataFrame(daily)
     for c in ["low", "high", "close", "volume"]:
@@ -537,4 +537,186 @@ def analyze(
         "cyqk": cyqk,
         "bottom_retention": bottom_retention,
         "decay_meta": decay_meta,
+    }
+
+
+def compute_short_term_chip_trend(
+    daily: List[Dict[str, Any]],
+    free_float_shares: Optional[float] = None,
+    windows: List[int] = None,
+) -> Dict[str, Any]:
+    """计算 5/10/20 日筹码分布对比,识别筹码迁移趋势。
+
+    对每个窗口用换手率衰减模型单独计算筹码分布,输出:
+    - 主峰位置 + 占比
+    - 集中度(±5%)
+    - CYQK(获利比例)
+    - ASR(活动筹码)
+
+    趋势判断:
+    - 主峰位置随窗口缩短而上移 = 筹码向上迁移(高位承接增强)
+    - 主峰位置随窗口缩短而下移 = 筹码向下迁移(低位承接增强)
+    - 主峰位置稳定 = 筹码锁定
+    - 集中度随窗口缩短而上升 = 短期筹码集中(主力吸筹或锁定)
+    - CYQK 随窗口缩短而上升 = 短期获利盘增加(抛压渐增)
+
+    Args:
+        daily: 日线数据(至少 max(windows)+30 天)
+        free_float_shares: 流通股本
+        windows: 窗口列表,默认 [5, 10, 20]
+
+    Returns:
+        {
+            "available": bool,
+            "windows": {5: {...}, 10: {...}, 20: {...}},
+            "trend": {
+                "peak_migration": "向上/向下/稳定",
+                "concentration_trend": "上升/下降/稳定",
+                "cyqk_trend": "上升/下降/稳定",
+            },
+            "interpretation": str,
+        }
+    """
+    if windows is None:
+        windows = [5, 10, 20]
+
+    df = pd.DataFrame(daily)
+    for c in ["low", "high", "close", "volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    if len(df) < max(windows) + 5:
+        return {"available": False, "reason": f"数据不足 {len(df)} < {max(windows)+5}"}
+
+    current_close = float(df["close"].iloc[-1])
+    window_results: Dict[int, Dict[str, Any]] = {}
+
+    for w in windows:
+        # 取最近 w 天
+        seg = df.tail(w).to_dict("records")
+        try:
+            bins, chip, meta = compute_chip_distribution(seg, free_float_shares)
+            peaks = find_peaks(bins, chip)
+            asr = compute_asr(bins, chip, current_close)
+            cyqk = compute_cyqk(bins, chip, current_close)
+            conc = concentration_ratio(bins, chip, current_close)
+
+            # 主峰(占比最高的)
+            if peaks:
+                dominant = max(peaks, key=lambda p: p.get("pct", 0))
+                dom_price = dominant.get("price")
+                dom_pct = dominant.get("pct")
+            else:
+                idx = int(np.argmax(chip))
+                dom_price = round(float(bins[idx]), 2)
+                dom_pct = round(float(chip[idx]), 2)
+
+            # 主峰相对当前价的位置
+            if dom_price is not None and current_close > 0:
+                rel = (dom_price - current_close) / current_close
+                if rel < -0.02:
+                    pos_label = "下方"
+                elif rel > 0.02:
+                    pos_label = "上方"
+                else:
+                    pos_label = "贴近"
+            else:
+                pos_label = "未知"
+
+            window_results[w] = {
+                "window": w,
+                "dominant_peak": {"price": dom_price, "pct": dom_pct, "position": pos_label},
+                "concentration_5pct": conc,
+                "cyqk_win_ratio": cyqk.get("win_ratio"),
+                "cyqk_label": cyqk.get("label"),
+                "asr_value": asr.get("value"),
+                "asr_label": asr.get("label"),
+                "decay_mode": meta.get("decay_mode"),
+                "peak_count": len(peaks),
+            }
+        except Exception as e:
+            window_results[w] = {"window": w, "error": str(e)}
+
+    # 趋势判断(需要 5/10/20 都有数据)
+    valid_windows = {w: r for w, r in window_results.items() if "error" not in r}
+    if len(valid_windows) < 2:
+        return {
+            "available": False,
+            "windows": window_results,
+            "reason": "有效窗口不足",
+        }
+
+    # 主峰迁移:对比短窗口(5)和长窗口(20)的主峰位置
+    short_w = min(valid_windows.keys())
+    long_w = max(valid_windows.keys())
+    short_peak = valid_windows[short_w].get("dominant_peak", {}).get("price")
+    long_peak = valid_windows[long_w].get("dominant_peak", {}).get("price")
+
+    peak_migration = "稳定"
+    if short_peak is not None and long_peak is not None and current_close > 0:
+        # 短窗口主峰相对当前价的偏移 vs 长窗口主峰相对当前价的偏移
+        short_off = (short_peak - current_close) / current_close
+        long_off = (long_peak - current_close) / current_close
+        diff = short_off - long_off
+        if diff > 0.02:
+            peak_migration = "向上迁移"
+        elif diff < -0.02:
+            peak_migration = "向下迁移"
+        else:
+            peak_migration = "稳定"
+
+    # 集中度趋势:短窗口 vs 长窗口
+    short_conc = valid_windows[short_w].get("concentration_5pct", 0) or 0
+    long_conc = valid_windows[long_w].get("concentration_5pct", 0) or 0
+    conc_diff = short_conc - long_conc
+    if conc_diff > 3:
+        conc_trend = "上升"
+    elif conc_diff < -3:
+        conc_trend = "下降"
+    else:
+        conc_trend = "稳定"
+
+    # CYQK 趋势:短窗口 vs 长窗口
+    short_cyqk = valid_windows[short_w].get("cyqk_win_ratio", 0) or 0
+    long_cyqk = valid_windows[long_w].get("cyqk_win_ratio", 0) or 0
+    cyqk_diff = short_cyqk - long_cyqk
+    if cyqk_diff > 5:
+        cyqk_trend = "上升"
+    elif cyqk_diff < -5:
+        cyqk_trend = "下降"
+    else:
+        cyqk_trend = "稳定"
+
+    # 综合解读
+    interpretations = []
+    if peak_migration == "向上迁移":
+        interpretations.append("短期主峰上移,高位承接增强(可能是吸筹或派发,需结合量价)")
+    elif peak_migration == "向下迁移":
+        interpretations.append("短期主峰下移,低位承接增强(可能是主力吸筹)")
+    else:
+        interpretations.append("主峰位置稳定,筹码锁定")
+
+    if conc_trend == "上升":
+        interpretations.append("短期集中度上升,筹码集中(主力吸筹或锁定)")
+    elif conc_trend == "下降":
+        interpretations.append("短期集中度下降,筹码分散(主力可能派发)")
+
+    if cyqk_trend == "上升":
+        interpretations.append("短期获利盘增加,抛压渐增")
+    elif cyqk_trend == "下降":
+        interpretations.append("短期获利盘减少,抛压减轻")
+
+    return {
+        "available": True,
+        "windows": window_results,
+        "current_close": current_close,
+        "trend": {
+            "peak_migration": peak_migration,
+            "concentration_trend": conc_trend,
+            "cyqk_trend": cyqk_trend,
+            "short_window": short_w,
+            "long_window": long_w,
+            "concentration_diff": round(conc_diff, 1),
+            "cyqk_diff": round(cyqk_diff, 1),
+        },
+        "interpretation": "; ".join(interpretations) if interpretations else "无明显趋势",
     }

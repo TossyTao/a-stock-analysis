@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 
 from chip_distribution import analyze as chip_analyze
+from chip_distribution import compute_short_term_chip_trend
 
 
 def to_df(daily: List[Dict[str, Any]]) -> pd.DataFrame:
@@ -202,6 +203,154 @@ def trend_5day(df: pd.DataFrame) -> Dict[str, Any]:
     }
 
 
+def trend_n_day(df: pd.DataFrame, n: int = 5) -> Dict[str, Any]:
+    """近 n 日量价趋势(线性回归斜率法)。trend_5day 的通用版。
+
+    Args:
+        df: 日线 DataFrame
+        n: 窗口天数(5/10/20)
+    """
+    if len(df) < n:
+        return {"price_trend": "数据不足", "vol_trend": "数据不足", "quadrant": "数据不足"}
+
+    last_n = df.tail(n).reset_index(drop=True)
+    price = last_n["close"].astype(float).values
+    vol = last_n["volume"].astype(float).values
+    x = np.arange(n)
+
+    price_slope = float(np.polyfit(x, price, 1)[0])
+    vol_slope = float(np.polyfit(x, vol, 1)[0])
+
+    price_mean = float(price.mean())
+    vol_mean = float(vol.mean())
+
+    price_slope_pct = (price_slope / price_mean * 100) if price_mean > 0 else 0.0
+    vol_slope_pct = (vol_slope / vol_mean * 100) if vol_mean > 0 else 0.0
+
+    PRICE_THRESHOLD = 0.3
+    VOL_THRESHOLD = 3.0
+
+    if price_slope_pct > PRICE_THRESHOLD:
+        price_trend = "价涨"
+    elif price_slope_pct < -PRICE_THRESHOLD:
+        price_trend = "价跌"
+    else:
+        price_trend = "价平"
+
+    if vol_slope_pct > VOL_THRESHOLD:
+        vol_trend = "量增"
+    elif vol_slope_pct < -VOL_THRESHOLD:
+        vol_trend = "量缩"
+    else:
+        vol_trend = "量平"
+
+    quadrant_n = f"{vol_trend}{price_trend}"
+
+    max_slope_ratio = max(
+        abs(price_slope_pct / PRICE_THRESHOLD) if price_trend != "价平" else 0,
+        abs(vol_slope_pct / VOL_THRESHOLD) if vol_trend != "量平" else 0,
+    )
+    if max_slope_ratio >= 3:
+        strength = "强"
+    elif max_slope_ratio >= 1.5:
+        strength = "中"
+    else:
+        strength = "弱"
+
+    # 总涨跌幅
+    price_chg_pct = ((price[-1] - price[0]) / price[0] * 100) if price[0] > 0 else 0.0
+    vol_chg_pct = ((vol[-1] - vol[0]) / vol[0] * 100) if vol[0] > 0 else 0.0
+
+    return {
+        "window": n,
+        "price_trend": price_trend,
+        "vol_trend": vol_trend,
+        "quadrant": quadrant_n,
+        "price_slope_pct": round(price_slope_pct, 2),
+        "vol_slope_pct": round(vol_slope_pct, 2),
+        "strength": strength,
+        "price_chg_pct": round(price_chg_pct, 2),
+        "vol_chg_pct": round(vol_chg_pct, 2),
+        "start_close": float(price[0]),
+        "end_close": float(price[-1]),
+        "start_vol": float(vol[0]),
+        "end_vol": float(vol[-1]),
+    }
+
+
+def compute_short_term_trend(df: pd.DataFrame, windows: List[int] = None) -> Dict[str, Any]:
+    """计算 5/10/20 日量价趋势对比,识别短期动量变化。
+
+    趋势判断:
+    - 价格加速度:5 日斜率 vs 10 日 vs 20 日,短期斜率 > 长期 = 加速上涨
+    - 量能配合:5 日量趋势 vs 10/20 日,短期放量 = 资金进入
+    - 象限一致性:5/10/20 日象限是否同向
+    """
+    if windows is None:
+        windows = [5, 10, 20]
+
+    window_results = {}
+    for w in windows:
+        window_results[w] = trend_n_day(df, w)
+
+    # 加速度判断:5 日斜率 vs 20 日斜率
+    short_w = min(windows)
+    long_w = max(windows)
+    short = window_results.get(short_w, {})
+    long = window_results.get(long_w, {})
+
+    acceleration = "稳定"
+    if short.get("price_slope_pct") is not None and long.get("price_slope_pct") is not None:
+        diff = short["price_slope_pct"] - long["price_slope_pct"]
+        if diff > 0.5:
+            acceleration = "加速上涨"
+        elif diff < -0.5:
+            acceleration = "加速下跌"
+        else:
+            acceleration = "稳定"
+
+    # 象限一致性
+    quads = [window_results[w].get("quadrant") for w in windows if window_results[w].get("quadrant")]
+    unique_quads = set(quads)
+    if len(unique_quads) == 1:
+        consistency_label = "三窗口一致"
+    elif len(unique_quads) == 2:
+        consistency_label = "两窗口一致"
+    else:
+        consistency_label = "三窗口分歧"
+
+    # 综合解读
+    interpretations = []
+    if acceleration == "加速上涨":
+        interpretations.append("短期动量加速向上(5日斜率 > 20日)")
+    elif acceleration == "加速下跌":
+        interpretations.append("短期动量加速向下(5日斜率 < 20日)")
+
+    # 5 日量价配合
+    short_quad = short.get("quadrant", "")
+    if "量增价涨" in short_quad:
+        interpretations.append("5日量增价涨,主力扫货或主升浪")
+    elif "量缩价涨" in short_quad:
+        interpretations.append("5日缩量价涨,筹码锁定")
+    elif "量增价跌" in short_quad:
+        interpretations.append("5日放量下跌,主力出逃或接恐慌盘(看位置)")
+    elif "量缩价跌" in short_quad:
+        interpretations.append("5日缩量阴跌,无承接")
+
+    if consistency_label == "三窗口一致":
+        interpretations.append(f"5/10/20 日象限一致({short_quad})")
+    elif consistency_label == "三窗口分歧":
+        interpretations.append("5/10/20 日象限分歧,趋势不稳")
+
+    return {
+        "available": True,
+        "windows": window_results,
+        "acceleration": acceleration,
+        "consistency": consistency_label,
+        "interpretation": "; ".join(interpretations) if interpretations else "无明显趋势",
+    }
+
+
 def top_divergence(df: pd.DataFrame, window: int = 20) -> Dict[str, Any]:
     """顶背离:近 window 日内价格创区间新高,但成交量未创新高。"""
     if len(df) < window:
@@ -310,6 +459,7 @@ def compute(daily: List[Dict[str, Any]]) -> Dict[str, Any]:
     ground = is_ground_vol(df["volume"])
     quad = quadrant(df)
     trend5 = trend_5day(df)
+    short_term_trend = compute_short_term_trend(df)
     top_div = top_divergence(df)
     bot_div = bottom_divergence(df)
     breakout = breakout_3day(df)
@@ -360,6 +510,7 @@ def compute(daily: List[Dict[str, Any]]) -> Dict[str, Any]:
         },
         "quadrant": quad,
         "trend_5d": trend5,
+        "short_term_trend": short_term_trend,
         "divergence": {
             "top": top_div,
             "bottom": bot_div,
@@ -379,12 +530,19 @@ def recompute_chip_with_float(
     """拿到流通股本后,用换手率衰减模型重算筹码(替换原固定 decay 的版本)。
 
     同时把 breakout.resistance 传给筹码模块用于升级信号判断。
+    另外计算 5/10/20 日短期筹码对比(需要流通股本才能用换手率衰减)。
     """
     breakout = indicators.get("breakout", {})
     resistance = breakout.get("resistance")
     try:
         new_chip = chip_analyze(daily, free_float_shares=free_float_shares, breakout_resistance=resistance)
         indicators["chip"] = new_chip
+    except Exception:
+        pass
+    # 5/10/20 日短期筹码对比
+    try:
+        short_term_chip = compute_short_term_chip_trend(daily, free_float_shares=free_float_shares)
+        indicators["short_term_chip"] = short_term_chip
     except Exception:
         pass
     return indicators

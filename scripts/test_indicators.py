@@ -1620,6 +1620,206 @@ def test_analyze_fundamental_no_research_reports():
     print("✅ test_analyze_fundamental_no_research_reports passed")
 
 
+# ===== 半导体行业特殊处理 + 短期筹码量价趋势 测试 =====
+
+def test_is_semiconductor_by_industry():
+    """半导体识别:行业关键词。"""
+    from fundamental import is_semiconductor
+    assert is_semiconductor("半导体", "", "") is True
+    assert is_semiconductor("集成电路", "", "") is True
+    assert is_semiconductor("EDA", "", "") is True
+    assert is_semiconductor("半导体设备", "", "") is True
+    assert is_semiconductor("功率半导体", "", "") is True
+    assert is_semiconductor("第三代半导体", "", "") is True
+    # 非半导体行业
+    assert is_semiconductor("食品饮料", "", "") is False
+    assert is_semiconductor("银行", "", "") is False
+    assert is_semiconductor("房地产", "", "") is False
+    print("✅ test_is_semiconductor_by_industry passed")
+
+
+def test_is_semiconductor_by_name():
+    """半导体识别:公司名称关键词。"""
+    from fundamental import is_semiconductor
+    assert is_semiconductor("", "301269", "华大九天") is True
+    assert is_semiconductor("", "688981", "中芯国际") is True
+    assert is_semiconductor("", "002049", "紫光国微") is True
+    assert is_semiconductor("", "603986", "兆易创新") is True
+    assert is_semiconductor("", "688256", "寒武纪") is True
+    # 非半导体公司
+    assert is_semiconductor("", "600519", "贵州茅台") is False
+    assert is_semiconductor("", "000001", "平安银行") is False
+    print("✅ test_is_semiconductor_by_name passed")
+
+
+def test_semiconductor_special_handling():
+    """端到端:半导体行业触发 special_handling,投资思路改写,基本面降级。"""
+    from fundamental import analyze_fundamental
+    financials = [
+        {"period": "20201231", "net_profit": -50, "revenue": 500, "roe": 5,
+         "operating_cf": -30, "debt_ratio_pct": 30, "total_assets": 800, "net_assets": 600,
+         "roic": 3, "fcf": -30, "gross_margin_pct": 80, "operating_profit": -80},
+        {"period": "20211231", "net_profit": -30, "revenue": 700, "roe": 4,
+         "operating_cf": -20, "debt_ratio_pct": 28, "total_assets": 900, "net_assets": 700,
+         "roic": 2, "fcf": -20, "gross_margin_pct": 82, "operating_profit": -50},
+        {"period": "20221231", "net_profit": -20, "revenue": 900, "roe": 3,
+         "operating_cf": -10, "debt_ratio_pct": 26, "total_assets": 1000, "net_assets": 800,
+         "roic": 1, "fcf": -10, "gross_margin_pct": 85, "operating_profit": -30},
+        {"period": "20231231", "net_profit": -10, "revenue": 1100, "roe": 2,
+         "operating_cf": 0, "debt_ratio_pct": 24, "total_assets": 1100, "net_assets": 900,
+         "roic": 1, "fcf": 0, "gross_margin_pct": 88, "operating_profit": -20},
+        {"period": "20241231", "net_profit": -5, "revenue": 1300, "roe": 1,
+         "operating_cf": 10, "debt_ratio_pct": 22, "total_assets": 1200, "net_assets": 1000,
+         "roic": 2, "fcf": 10, "gross_margin_pct": 90, "operating_profit": -10},
+    ]
+    r = analyze_fundamental("301269", "华大九天", None, pe=1195, pb=15, financials=financials)
+    assert "semiconductor_handling" in r
+    sh = r["semiconductor_handling"]
+    assert sh is not None
+    assert sh["is_semiconductor"] is True
+    assert sh["fundamental_weight"] == "low"
+    assert sh["short_term_weight"] == "high"
+    # 投资思路被改写
+    appr = r["investment_approach"]
+    assert "半导体" in appr["approach"]
+    assert "短期" in appr["approach"]
+    # evidence 含半导体提示
+    ev = r["classification"]["evidence"]
+    assert any("半导体行业:基本面权重降级" in e for e in ev)
+    assert any("国产替代" in e for e in ev)
+    print(f"✅ test_semiconductor_special_handling passed (approach={appr['approach']})")
+
+
+def test_non_semiconductor_no_special_handling():
+    """端到端:非半导体行业不触发 special_handling。"""
+    from fundamental import analyze_fundamental
+    financials = [
+        {"period": "20231231", "net_profit": 100, "revenue": 1000, "roe": 18,
+         "operating_cf": 110, "debt_ratio_pct": 35, "total_assets": 500, "net_assets": 325,
+         "roic": 15, "fcf": 110, "gross_margin_pct": 60, "operating_profit": 95},
+        {"period": "20241231", "net_profit": 110, "revenue": 1100, "roe": 19,
+         "operating_cf": 115, "debt_ratio_pct": 33, "total_assets": 540, "net_assets": 365,
+         "roic": 16, "fcf": 115, "gross_margin_pct": 61, "operating_profit": 105},
+    ]
+    r = analyze_fundamental("600519", "贵州茅台", "食品饮料", pe=30, pb=10, financials=financials)
+    assert r.get("semiconductor_handling") is None
+    print("✅ test_non_semiconductor_no_special_handling passed")
+
+
+def test_short_term_chip_trend_basic():
+    """短期筹码对比:5/10/20 日窗口都返回数据。"""
+    from chip_distribution import compute_short_term_chip_trend
+    import random
+    random.seed(42)
+    daily = []
+    price = 100
+    for i in range(120):
+        op = price
+        cl = price + random.uniform(-1, 1.5)
+        hi = max(op, cl) + random.uniform(0, 0.8)
+        lo = min(op, cl) - random.uniform(0, 0.8)
+        vol = 100000 + i * 800 + random.randint(-10000, 20000)
+        daily.append({"open": op, "high": hi, "low": lo, "close": cl, "volume": vol})
+        price = cl
+    r = compute_short_term_chip_trend(daily, free_float_shares=5000000, windows=[5, 10, 20])
+    assert r["available"] is True
+    assert 5 in r["windows"]
+    assert 10 in r["windows"]
+    assert 20 in r["windows"]
+    # 每个窗口都有主峰和 CYQK
+    for w in [5, 10, 20]:
+        w_data = r["windows"][w]
+        assert "dominant_peak" in w_data
+        assert "cyqk_win_ratio" in w_data
+        assert "concentration_5pct" in w_data
+    # 趋势字段
+    assert "trend" in r
+    assert "peak_migration" in r["trend"]
+    assert "concentration_trend" in r["trend"]
+    assert "cyqk_trend" in r["trend"]
+    print(f"✅ test_short_term_chip_trend_basic passed (trend={r['trend']})")
+
+
+def test_short_term_chip_trend_concentration_rising():
+    """短期筹码对比:5 日集中度 > 20 日,识别筹码集中。"""
+    from chip_distribution import compute_short_term_chip_trend
+    # 构造数据:前 110 天分散波动,后 10 天在 117-118 区间密集成交
+    # 5 日窗口全是集中区,20 日窗口包含 10 天分散 + 10 天集中
+    daily = []
+    for i in range(110):
+        p = 100 + (i % 10)
+        daily.append({"open": p, "high": p+1, "low": p-1, "close": p, "volume": 50000})
+    for i in range(10):
+        p = 117 + (i % 3) * 0.5
+        daily.append({"open": p, "high": p+1, "low": p-1, "close": p, "volume": 200000})
+    r = compute_short_term_chip_trend(daily, free_float_shares=5000000, windows=[5, 10, 20])
+    assert r["available"] is True
+    short_conc = r["windows"][5]["concentration_5pct"]
+    long_conc = r["windows"][20]["concentration_5pct"]
+    # 5 日集中度应明显高于 20 日
+    assert short_conc > long_conc
+    assert r["trend"]["concentration_trend"] == "上升"
+    print(f"✅ test_short_term_chip_trend_concentration_rising passed (5d={short_conc}% vs 20d={long_conc}%, {r['trend']['concentration_trend']})")
+
+
+def test_short_term_trend_acceleration():
+    """短期量价趋势:5 日斜率 > 20 日 = 加速上涨。"""
+    from compute_indicators import compute_short_term_trend
+    import pandas as pd
+    # 构造数据:前 100 天震荡,后 15 天慢涨,最后 5 天加速上涨
+    df_data = []
+    for i in range(100):
+        p = 100 + (i % 5)
+        df_data.append({"open": p, "high": p+1, "low": p-1, "close": p, "volume": 50000, "amount": 50000*p})
+    # 后 15 天慢涨(每天 +0.3)
+    for i in range(15):
+        p = 105 + i * 0.3
+        df_data.append({"open": p, "high": p+1, "low": p-1, "close": p, "volume": 70000, "amount": 70000*p})
+    # 最后 5 天加速(每天 +2,量也递增)
+    for i in range(5):
+        p = 110 + i * 2
+        v = 100000 + i * 15000
+        df_data.append({"open": p, "high": p+2, "low": p-0.5, "close": p+1, "volume": v, "amount": v*p})
+    df = pd.DataFrame(df_data)
+    r = compute_short_term_trend(df, windows=[5, 10, 20])
+    assert r["available"] is True
+    assert r["acceleration"] == "加速上涨"
+    # 5 日象限应该是量增价涨
+    assert "量增" in r["windows"][5]["quadrant"]
+    assert "价涨" in r["windows"][5]["quadrant"]
+    print(f"✅ test_short_term_trend_acceleration passed (acceleration={r['acceleration']}, 5d={r['windows'][5]['quadrant']})")
+
+
+def test_short_term_trend_in_compute():
+    """端到端:compute() 输出包含 short_term_trend 字段。"""
+    from compute_indicators import compute
+    closes = [10 + i * 0.05 for i in range(120)]
+    vols = [1000 + i * 5 for i in range(120)]
+    daily = make_daily(closes, vols)
+    indicators = compute(daily)
+    assert "short_term_trend" in indicators
+    stt = indicators["short_term_trend"]
+    assert stt["available"] is True
+    assert "windows" in stt
+    assert "acceleration" in stt
+    print(f"✅ test_short_term_trend_in_compute passed (acceleration={stt['acceleration']})")
+
+
+def test_short_term_chip_in_recompute():
+    """端到端:recompute_chip_with_float 后含 short_term_chip 字段。"""
+    from compute_indicators import compute, recompute_chip_with_float
+    closes = [10 + i * 0.05 for i in range(120)]
+    vols = [1000 + i * 5 for i in range(120)]
+    daily = make_daily(closes, vols)
+    indicators = compute(daily)
+    assert "short_term_chip" not in indicators  # 没 free_float_shares 时不算
+    indicators = recompute_chip_with_float(indicators, daily, free_float_shares=500000)
+    assert "short_term_chip" in indicators
+    stc = indicators["short_term_chip"]
+    assert stc["available"] is True
+    print(f"✅ test_short_term_chip_in_recompute passed (trend={stc.get('trend', {}).get('peak_migration')})")
+
+
 if __name__ == "__main__":
     test_position_percentile()
     test_position_label()
@@ -1737,4 +1937,14 @@ if __name__ == "__main__":
     test_summarize_research_report_weak()
     test_analyze_fundamental_with_research_reports()
     test_analyze_fundamental_no_research_reports()
+    # 半导体行业特殊处理 + 短期筹码量价趋势
+    test_is_semiconductor_by_industry()
+    test_is_semiconductor_by_name()
+    test_semiconductor_special_handling()
+    test_non_semiconductor_no_special_handling()
+    test_short_term_chip_trend_basic()
+    test_short_term_chip_trend_concentration_rising()
+    test_short_term_trend_acceleration()
+    test_short_term_trend_in_compute()
+    test_short_term_chip_in_recompute()
     print("\n🎉 All tests passed!")
