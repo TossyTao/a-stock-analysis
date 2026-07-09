@@ -292,6 +292,293 @@ def compute_roic_stability(roics: List[float], periods: List[str] = None) -> Dic
     }
 
 
+def compute_roe_stability(roes: List[float], periods: List[str] = None) -> Dict[str, Any]:
+    """ROE 稳定性(巴菲特选股核心指标)。
+
+    巴菲特标准:
+    - 5-10 年均 ROE > 15%
+    - 单年 ROE 不低于 12%
+
+    返回:mean / std / cv / min / trend / buffett_pass(均>15% + 单年≥12%)
+    """
+    valid_idx = [(i, r) for i, r in enumerate(roes) if r is not None]
+    if len(valid_idx) < 2:
+        return {"available": False, "reason": "ROE 数据不足"}
+
+    # 季节性调整:优先用年报(period endswith "1231")
+    if periods and len(periods) == len(roes):
+        annual_pairs = [(str(p), r) for p, r in zip(periods, roes)
+                        if r is not None and str(p).endswith("1231")]
+        if len(annual_pairs) >= 2:
+            valid = [r for _, r in annual_pairs]
+            used_periods = [p for p, _ in annual_pairs]
+            seasonal_adjusted = True
+        else:
+            valid = [r for _, r in valid_idx]
+            used_periods = None
+            seasonal_adjusted = False
+    else:
+        valid = [r for _, r in valid_idx]
+        used_periods = None
+        seasonal_adjusted = False
+
+    mean = sum(valid) / len(valid)
+    std = (sum((r - mean) ** 2 for r in valid) / len(valid)) ** 0.5
+    cv = std / mean if mean != 0 else None
+    min_roe = min(valid)
+    max_roe = max(valid)
+
+    # 趋势:比较前 1/3 和后 1/3
+    n = len(valid)
+    if n >= 4:
+        first_third = valid[: max(1, n // 3)]
+        last_third = valid[-(max(1, n // 3)):]
+        first_mean = sum(first_third) / len(first_third)
+        last_mean = sum(last_third) / len(last_third)
+        if last_mean > first_mean * 1.10:
+            trend = "上升"
+        elif last_mean < first_mean * 0.90:
+            trend = "下降"
+        else:
+            trend = "平稳"
+    else:
+        trend = "数据不足"
+
+    # 巴菲特标准
+    buffett_mean_pass = mean > 15
+    buffett_min_pass = min_roe >= 12
+    buffett_pass = buffett_mean_pass and buffett_min_pass
+
+    return {
+        "available": True,
+        "mean": round(mean, 2),
+        "std": round(std, 2),
+        "cv": round(cv, 2) if cv is not None else None,
+        "min": round(min_roe, 2),
+        "max": round(max_roe, 2),
+        "trend": trend,
+        "values": valid,
+        "seasonal_adjusted": seasonal_adjusted,
+        "used_periods": used_periods,
+        "buffett_filter": {
+            "mean_pass": buffett_mean_pass,
+            "min_pass": buffett_min_pass,
+            "pass": buffett_pass,
+            "criteria": "5-10 年均 ROE > 15% + 单年 ≥ 12%",
+        },
+    }
+
+
+def compute_dupont_analysis(financials: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """杜邦分析:ROE = 净利率 × 总资产周转率 × 权益乘数。
+
+    三种模式:
+    - 高净利率(茅台/爱马仕)- 安全,定价权强
+    - 高周转率(Costco/沃尔玛)- 稳健,运营效率高
+    - 高杠杆(房企/银行)- 风险大,杠杆依赖
+
+    数据来源优先级:
+    - 优先用 sina 直接提供的 equity_multiplier / asset_turnover(更准)
+    - 否则用 total_assets / net_assets 计算
+
+    返回最新一期的三因素拆解 + 主导模式判断。
+    """
+    # 优先用 sina 直接提供的字段
+    valid_direct = [
+        f for f in financials
+        if f.get("equity_multiplier") is not None
+        and f.get("asset_turnover") is not None
+        and f.get("net_profit") is not None
+        and f.get("revenue") is not None and f.get("revenue") != 0
+    ]
+    # 兜底:用 total_assets / net_assets 计算
+    valid_compute = [
+        f for f in financials
+        if f.get("total_assets") is not None and f.get("net_assets") is not None
+        and f.get("net_profit") is not None
+        and f.get("revenue") is not None and f.get("revenue") != 0
+        and f.get("total_assets", 0) != 0 and f.get("net_assets", 0) != 0
+    ]
+
+    if valid_direct:
+        latest = valid_direct[-1]
+        net_margin = latest["net_profit"] / latest["revenue"]
+        asset_turnover = latest["asset_turnover"]
+        equity_multiplier = latest["equity_multiplier"]
+        source = "sina_direct"
+    elif valid_compute:
+        latest = valid_compute[-1]
+        net_margin = latest["net_profit"] / latest["revenue"]
+        asset_turnover = latest["revenue"] / latest["total_assets"]
+        equity_multiplier = latest["total_assets"] / latest["net_assets"]
+        source = "computed"
+    else:
+        return {"available": False, "reason": "缺杜邦分析所需字段(净利/营收/总资产/净资产 或 权益乘数/周转率)"}
+
+    derived_roe = net_margin * asset_turnover * equity_multiplier
+
+    # 模式判断(对比三因素的水平)
+    # 高净利率:net_margin > 15% (茅台 ~50%,爱马仕 ~30%)
+    # 高周转:asset_turnover > 1.0 (Costco ~3.5,沃尔玛 ~2.5)
+    # 高杠杆:equity_multiplier > 5 (房企 ~10,银行 ~12)
+    mode_signals = {
+        "high_margin": net_margin > 0.15,
+        "high_turnover": asset_turnover > 1.0,
+        "high_leverage": equity_multiplier > 5.0,
+    }
+    # 主导模式:取最显著的那个(标准化对比)
+    norm_margin = min(net_margin / 0.15, 1.0) if net_margin > 0 else 0
+    norm_turnover = min(asset_turnover / 1.0, 1.0) if asset_turnover > 0 else 0
+    norm_leverage = min(equity_multiplier / 5.0, 1.0) if equity_multiplier > 0 else 0
+    norms = {"高净利率": norm_margin, "高周转": norm_turnover, "高杠杆": norm_leverage}
+    dominant_mode = max(norms, key=norms.get) if any(norms.values()) else "无明显主导"
+
+    mode_label = {
+        "高净利率": "高净利率驱动(茅台/爱马仕式,定价权强,安全)",
+        "高周转": "高周转驱动(Costco/沃尔玛式,运营效率,稳健)",
+        "高杠杆": "高杠杆驱动(房企/银行式,风险大,杠杆依赖)",
+        "无明显主导": "无明显主导模式",
+    }[dominant_mode]
+
+    return {
+        "available": True,
+        "period": latest.get("period"),
+        "net_margin": round(net_margin * 100, 2),  # %
+        "asset_turnover": round(asset_turnover, 3),
+        "equity_multiplier": round(equity_multiplier, 2),
+        "derived_roe": round(derived_roe * 100, 2),  # %
+        "reported_roe": latest.get("roe"),
+        "dominant_mode": dominant_mode,
+        "mode_label": mode_label,
+        "mode_signals": mode_signals,
+        "source": source,
+    }
+
+
+def compute_buffett_filter(financials: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """巴菲特三步筛选:
+    1. 5-10 年均 ROE > 15% + 单年 ≥ 12%
+    2. 资产负债率 < 50%
+    3. 经营现金流 ≥ 净利润
+
+    返回每步通过情况 + 综合判断。
+    """
+    roes = [_safe_float(f.get("roe")) for f in financials]
+    periods = [f.get("period") for f in financials]
+    roe_stab = compute_roe_stability(roes, periods)
+
+    # 第 1 步:ROE 标准
+    step1_pass = roe_stab.get("buffett_filter", {}).get("pass", False) if roe_stab.get("available") else False
+    step1_detail = (
+        f"5-10 年均 ROE {roe_stab.get('mean')}% (>{15}%? {roe_stab.get('buffett_filter',{}).get('mean_pass')}) / "
+        f"单年最低 {roe_stab.get('min')}% (≥12%? {roe_stab.get('buffett_filter',{}).get('min_pass')})"
+        if roe_stab.get("available") else "ROE 数据不足"
+    )
+
+    # 第 2 步:资产负债率 < 50%(最新一期)
+    latest_with_debt = [f for f in financials if f.get("debt_ratio_pct") is not None]
+    if latest_with_debt:
+        latest_debt = latest_with_debt[-1]["debt_ratio_pct"]
+        step2_pass = latest_debt < 50
+        step2_detail = f"最新资产负债率 {latest_debt}% (<50%? {step2_pass})"
+    else:
+        step2_pass = False
+        step2_detail = "资产负债率数据缺失"
+
+    # 第 3 步:经营现金流 ≥ 净利润(最新一期)
+    latest_with_cf = [f for f in financials if f.get("operating_cf") is not None and f.get("net_profit") is not None]
+    if latest_with_cf:
+        cf = latest_with_cf[-1]["operating_cf"]
+        np_ = latest_with_cf[-1]["net_profit"]
+        step3_pass = cf >= np_
+        step3_detail = f"最新经营现金流 {cf:,.0f} vs 净利润 {np_:,.0f} (≥? {step3_pass})"
+    else:
+        step3_pass = False
+        step3_detail = "现金流/净利润数据缺失"
+
+    all_pass = step1_pass and step2_pass and step3_pass
+
+    return {
+        "available": True,
+        "step1_roe": {"pass": step1_pass, "detail": step1_detail},
+        "step2_debt": {"pass": step2_pass, "detail": step2_detail},
+        "step3_cashflow": {"pass": step3_pass, "detail": step3_detail},
+        "all_pass": all_pass,
+        "interpretation": (
+            "巴菲特三步全过 - 长期稳、低负债、现金流匹配,优质标的"
+            if all_pass else
+            "未全过 - " + "; ".join(
+                f"步骤{ i+1 } 未通过"
+                for i, p in enumerate([step1_pass, step2_pass, step3_pass]) if not p
+            )
+        ),
+    }
+
+
+def detect_fake_roe(financials: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """假高 ROE 识别:
+    1. 高杠杆驱动(权益乘数 > 5 且净利率 < 10%) - 银行/房企式,风险大
+    2. 一次性收益(扣非/NI < 0.7) - 卖资产凑利润
+    3. 回购缩分母(净资产同比下降但净利润持平/上升) - 波音案例
+
+    返回各项警告 + 综合判断。
+    """
+    warnings = []
+
+    # 1. 高杠杆驱动
+    dupont = compute_dupont_analysis(financials)
+    if dupont.get("available"):
+        em = dupont["equity_multiplier"]
+        nm = dupont["net_margin"]
+        if em > 5 and nm < 10:
+            warnings.append({
+                "type": "high_leverage",
+                "severity": "高" if em > 8 else "中",
+                "detail": f"权益乘数 {em} (>5) + 净利率 {nm}% (<10%) - ROE 由杠杆驱动,非经营效率,风险大",
+                "case": "房企/银行式高杠杆,波音举债回购案例",
+            })
+
+    # 2. 一次性收益(用最新一期的扣非/NI)
+    latest_with_op = [f for f in financials if f.get("operating_profit") is not None and f.get("net_profit") is not None and f.get("net_profit") != 0]
+    if latest_with_op:
+        latest = latest_with_op[-1]
+        ratio = latest["operating_profit"] / latest["net_profit"]
+        if ratio < 0.7:
+            warnings.append({
+                "type": "one_shot_gain",
+                "severity": "高" if ratio < 0.4 else "中",
+                "detail": f"扣非/NI = {ratio:.2f} (<0.7) - 主业贡献低,ROE 靠一次性损益(卖资产/政府补贴)撑高",
+                "case": "卖资产、政府补贴、投资收益一次性抬高净利润",
+            })
+
+    # 3. 回购缩分母(净资产同比下降,净利润未同比下降)
+    valid_assets = [(i, f) for i, f in enumerate(financials) if f.get("net_assets") is not None and f.get("net_profit") is not None]
+    if len(valid_assets) >= 2:
+        prev = valid_assets[-2][1]
+        curr = valid_assets[-1][1]
+        assets_change = (curr["net_assets"] - prev["net_assets"]) / prev["net_assets"] if prev["net_assets"] != 0 else 0
+        profit_change = (curr["net_profit"] - prev["net_profit"]) / abs(prev["net_profit"]) if prev["net_profit"] != 0 else 0
+        # 净资产下降 > 5% 且净利润未下降(持平或上升)= 回购缩分母嫌疑
+        if assets_change < -0.05 and profit_change >= -0.05:
+            warnings.append({
+                "type": "buyback_shrink",
+                "severity": "中",
+                "detail": f"净资产同比下降 {abs(assets_change)*100:.1f}% 但净利润未下降(变化 {profit_change*100:.1f}%) - 疑似回购缩分母抬高 ROE",
+                "case": "波音式举债回购,净资产缩小推高 ROE,但债务风险累积",
+            })
+
+    return {
+        "available": True,
+        "warnings": warnings,
+        "is_fake": len(warnings) > 0,
+        "warning_count": len(warnings),
+        "interpretation": (
+            f"⚠️ 检测到 {len(warnings)} 个假高 ROE 信号 - 需警惕 ROE 来源"
+            if warnings else "✅ 未检测到假高 ROE 信号,ROE 来源健康"
+        ),
+    }
+
+
 def compute_profit_growth(profits: List[float]) -> Dict[str, Any]:
     """利润增长一致性:逐年增长率 + 是否全部为正。"""
     valid = [p for p in profits if p is not None and p != 0]
@@ -854,6 +1141,13 @@ def analyze_fundamental(
     revenue_growth = compute_revenue_growth(revenues)
     operating_profit = compute_operating_profit_quality(operating_profits, profits)
 
+    # ROE 深度分析:稳定性 + 杜邦 + 巴菲特筛选 + 假高 ROE 识别
+    roes = [_safe_float(f.get("roe")) for f in financials]
+    roe_stability = compute_roe_stability(roes, periods)
+    dupont = compute_dupont_analysis(financials)
+    buffett = compute_buffett_filter(financials)
+    fake_roe = detect_fake_roe(financials)
+
     classification = classify_stock_type(
         industry_info, roic_stability, profit_growth, fcf_quality,
         narrative_info=narrative_info,
@@ -861,6 +1155,38 @@ def analyze_fundamental(
         revenue_growth=revenue_growth,
         operating_profit=operating_profit,
     )
+
+    # 把 ROE 证据加入 classification.evidence
+    roe_evidence = []
+    if roe_stability.get("available"):
+        roe_evidence.append(
+            f"ROE 均值 {roe_stability['mean']}%(min {roe_stability['min']}%,{roe_stability['trend']})"
+        )
+        bf = roe_stability.get("buffett_filter", {})
+        if bf.get("pass"):
+            roe_evidence.append("✅ ROE 达巴菲特标准(均>15% + 单年≥12%)")
+        else:
+            roe_evidence.append(
+                f"⚠️ ROE 未达巴菲特标准(均{'>' if bf.get('mean_pass') else '<'}15% "
+                f"/ 单年{'≥' if bf.get('min_pass') else '<'}12%)"
+            )
+    if dupont.get("available"):
+        roe_evidence.append(
+            f"杜邦:{dupont['mode_label']} "
+            f"(净利率 {dupont['net_margin']}% / 周转 {dupont['asset_turnover']} / 权益乘数 {dupont['equity_multiplier']})"
+        )
+    if fake_roe.get("is_fake"):
+        for w in fake_roe["warnings"]:
+            roe_evidence.append(f"⚠️ 假高 ROE - {w['detail']}")
+    if roe_evidence:
+        classification["evidence"] = roe_evidence + classification.get("evidence", [])
+        classification["roe_quality"] = {
+            "roe_stability": roe_stability,
+            "dupont": dupont,
+            "buffett_filter": buffett,
+            "fake_roe": fake_roe,
+        }
+
     pe_trap = detect_pe_trap(classification["type"], pe, profit_growth)
     approach = investment_approach(classification["type"])
 
@@ -874,4 +1200,10 @@ def analyze_fundamental(
         "pe_trap": pe_trap,
         "investment_approach": approach,
         "geopolitical_risk": geopolitical_risk,
+        "roe_quality": {
+            "roe_stability": roe_stability,
+            "dupont": dupont,
+            "buffett_filter": buffett,
+            "fake_roe": fake_roe,
+        },
     }

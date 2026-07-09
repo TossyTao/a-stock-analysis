@@ -563,6 +563,15 @@ def _parse_sina_financials(abstract) -> list:
         "净资产收益率(ROE)": "roe",
         "基本每股收益": "eps",
         "销售毛利率": "gross_margin_pct",  # 部分公司直接提供
+        "资产负债率": "debt_ratio_pct",  # 直接提供百分比
+        "资产总计": "total_assets",
+        "负债合计": "total_liabilities",
+        "归属于母公司股东权益合计": "net_assets",
+        "股东权益合计": "net_assets",
+        "所有者权益合计": "net_assets",
+        "权益乘数": "equity_multiplier",  # sina 直接提供,用于杜邦分析
+        "总资产周转率": "asset_turnover",  # sina 直接提供
+        "总资产净利率_平均": "roa",
     }
 
     # 收集各指标的时间序列
@@ -603,6 +612,15 @@ def _parse_sina_financials(abstract) -> list:
         # 毛利率:若 sina 未直接提供,用 (revenue - operating_cost) / revenue 计算
         if fin.get("gross_margin_pct") is None and fin.get("revenue") and fin.get("operating_cost") and fin["revenue"] != 0:
             fin["gross_margin_pct"] = round((fin["revenue"] - fin["operating_cost"]) / fin["revenue"] * 100, 2)
+        # 资产负债率:若无直接提供,用 (负债合计 / 资产总计) * 100 兜底
+        if fin.get("debt_ratio_pct") is None and fin.get("total_liabilities") and fin.get("total_assets") and fin["total_assets"] != 0:
+            fin["debt_ratio_pct"] = round(fin["total_liabilities"] / fin["total_assets"] * 100, 2)
+        # 净资产兜底:若无直接提供,用 总资产 - 负债合计
+        if fin.get("net_assets") is None and fin.get("total_assets") and fin.get("total_liabilities"):
+            fin["net_assets"] = fin["total_assets"] - fin["total_liabilities"]
+        # 总资产兜底:若无直接提供但有净资产+资产负债率,用 net_assets / (1 - debt_ratio/100)
+        if fin.get("total_assets") is None and fin.get("net_assets") and fin.get("debt_ratio_pct") is not None and fin["debt_ratio_pct"] < 100:
+            fin["total_assets"] = fin["net_assets"] / (1 - fin["debt_ratio_pct"] / 100)
         result.append(fin)
     return result
 

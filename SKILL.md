@@ -202,7 +202,33 @@ python3 analyze.py 000001 --no-fundamental  # 跳过基本面(网络差时)
 
 **季节性调整:** `fundamental.classification.roic.seasonal_adjusted = true` 时,ROIC cv 用年度数据(period 末尾 1231)计算,避免季度季节性失真。电力设备、电网、工程机械等 Q4 集中回款行业,季度 ROIC 波动天然大,用季度数据算 cv 会高估不稳定性误判为周期股。若 `seasonal_adjusted = false`,需警惕 cv 可能受季节性影响。
 
-### 3.6 投资思路(从 `fundamental.investment_approach` 读取)
+### 3.6 ROE 深度分析(巴菲特 + 杜邦 + 假高 ROE 识别)
+
+从 `fundamental.roe_quality` 读取。ROE 是巴菲特选股核心指标(净利润÷净资产),单纯看净利润增速容易踩坑 - 千万本金大厂 ROE 可能才 6%,十万本金小店却能到 30%,资本效率差远了。
+
+**杜邦分析三模式**(`roe_quality.dupont`):
+
+| 模式 | 三因素特征 | 案例 | 风险 |
+|------|-----------|------|------|
+| 高净利率驱动 | 净利率 >15% | 茅台/爱马仕 | ✅ 安全,定价权强 |
+| 高周转驱动 | 周转率 >1.0 | Costco/沃尔玛 | ✅ 稳健,运营效率 |
+| 高杠杆驱动 | 权益乘数 >5 | 房企/银行 | ⚠️ 风险大,杠杆依赖 |
+
+**巴菲特三步筛选**(`roe_quality.buffett_filter`):
+1. 5-10 年均 ROE >15% + 单年 ≥12%(`step1_roe`)
+2. 资产负债率 <50%(`step2_debt`)
+3. 经营现金流 ≥ 净利润(`step3_cashflow`)
+
+三步全过 = 长期稳、低负债、现金流匹配的优质标的。
+
+**假高 ROE 识别**(`roe_quality.fake_roe.warnings`):
+- `high_leverage`:权益乘数 >5 + 净利率 <10% - ROE 由杠杆驱动非经营效率(房企/银行式,波音举债回购案例)
+- `one_shot_gain`:扣非/NI <0.7 - ROE 靠卖资产/政府补贴/投资收益一次性撑高
+- `buyback_shrink`:净资产同比下降但净利润未下降 - 疑似回购缩分母推高 ROE(波音案例)
+
+**ROE 稳定性**(`roe_quality.roe_stability`):均值/min/max/cv/趋势 + `buffett_filter`(均>15% + 单年≥12%)。带季节性调整(优先用年报数据)。
+
+### 3.7 投资思路(从 `fundamental.investment_approach` 读取)
 
 | 类型 | 思路 | 操作 |
 |------|------|------|
@@ -310,13 +336,18 @@ CYQK 获利比例:{cyqk.win_ratio}%({cyqk.label}) - {cyqk.interpretation}
 底仓追踪:底仓价 {bottom_retention.bottom_peak_price} / 保留率 {retention_ratio} / 涨幅 {price_rise_pct} -> {signal}
 解读:{chip.pattern.interpretation}
 
-## 四、公司质地判断
+## 四、公司质地判断(含 ROE 深度分析)
 类型:{fundamental.classification.type}
 行业:{industry} / PE:{pe} / PB:{pb}
 判定依据:{classification.evidence}(逐条列)
 ROIC:{roic.mean}({roic.trend},cv={roic.cv}) / 利润增长:{profit_growth.all_positive}(max {max_rate}) / FCF/NI:{fcf_quality.mean_ratio}
 毛利率:{gross_margin.latest}%({gross_margin.trend},均值 {gross_margin.mean}%) / 营收增长:{revenue_growth.all_positive}(均值 {revenue_growth.mean_rate*100}%) / 扣非/NI:{operating_profit.mean_ratio}({operating_profit.quality})
 行业叙事:{narrative.narratives 或 "无"}
+**ROE 深度分析**:
+- 稳定性:均 {roe_stability.mean}% / min {roe_stability.min}% / cv {roe_stability.cv} / {roe_stability.trend} / 巴菲特 ROE 标准 {buffett_filter.pass}
+- 杜邦:净利率 {dupont.net_margin}% × 周转 {dupont.asset_turnover} × 权益乘数 {dupont.equity_multiplier} -> {dupont.mode_label}
+- 巴菲特三步:ROE {buffett_filter.step1_roe.pass} / 负债 {buffett_filter.step2_debt.pass} / 现金流 {buffett_filter.step3_cashflow.pass} / 全过 {buffett_filter.all_pass}
+- 假高 ROE 识别:{fake_roe.is_fake or "无警告"} - {fake_roe.interpretation}
 
 ## 五、政治/地缘/政策风险评估
 风险敞口:{geopolitical_risk.risk_types}(逐条列,无则"无明显风险敞口")

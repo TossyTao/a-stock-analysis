@@ -898,6 +898,235 @@ def test_bank_quality_pb_missing():
     print(f"✅ test_bank_quality_pb_missing passed")
 
 
+# ===== ROE 深度分析测试(巴菲特 + 杜邦 + 假高 ROE) =====
+
+def test_roe_stability_buffett_pass():
+    """巴菲特标准:5 年均 ROE > 15% + 单年 ≥ 12% -> 通过。"""
+    from fundamental import compute_roe_stability
+    # 茅台式:5 年 ROE 都 > 20%,稳定
+    roes = [25, 28, 30, 27, 29]
+    r = compute_roe_stability(roes)
+    assert r["available"] is True
+    assert r["mean"] > 15
+    assert r["min"] >= 12
+    assert r["buffett_filter"]["pass"] is True
+    print(f"✅ test_roe_stability_buffett_pass passed (mean={r['mean']}%, min={r['min']}%)")
+
+
+def test_roe_stability_buffett_fail_low_mean():
+    """均 ROE < 15% -> 巴菲特标准未过。"""
+    from fundamental import compute_roe_stability
+    roes = [10, 11, 12, 13, 14]  # 均值 12,不达 15%
+    r = compute_roe_stability(roes)
+    assert r["buffett_filter"]["pass"] is False
+    assert r["buffett_filter"]["mean_pass"] is False
+    print(f"✅ test_roe_stability_buffett_fail_low_mean passed (mean={r['mean']}%)")
+
+
+def test_roe_stability_buffett_fail_low_min():
+    """单年 ROE < 12% -> 巴菲特标准未过(虽然均值可能 > 15%)。"""
+    from fundamental import compute_roe_stability
+    # 某年掉到 8%,均值仍 > 15%
+    roes = [20, 22, 8, 24, 25]
+    r = compute_roe_stability(roes)
+    assert r["buffett_filter"]["pass"] is False
+    assert r["buffett_filter"]["min_pass"] is False
+    assert r["min"] < 12
+    print(f"✅ test_roe_stability_buffett_fail_low_min passed (min={r['min']}%)")
+
+
+def test_dupont_high_margin_mode():
+    """杜邦分析:高净利率驱动(茅台式)。净利率 > 15% + 权益乘数低。"""
+    from fundamental import compute_dupont_analysis
+    # 茅台式:净利率 50%,周转 0.5,权益乘数 1.5
+    financials = [
+        {"period": "20241231", "net_profit": 50, "revenue": 100,
+         "total_assets": 200, "net_assets": 130, "roe": 38.5},
+    ]
+    r = compute_dupont_analysis(financials)
+    assert r["available"] is True
+    assert r["net_margin"] > 15
+    assert r["dominant_mode"] == "高净利率"
+    print(f"✅ test_dupont_high_margin_mode passed (mode={r['dominant_mode']}, 净利率={r['net_margin']}%)")
+
+
+def test_dupont_high_turnover_mode():
+    """杜邦分析:高周转驱动(Costco 式)。周转 > 1.0。"""
+    from fundamental import compute_dupont_analysis
+    # Costco 式:净利率 2%,周转 3.5,权益乘数 2.5
+    financials = [
+        {"period": "20241231", "net_profit": 7, "revenue": 350,
+         "total_assets": 100, "net_assets": 40, "roe": 17.5},
+    ]
+    r = compute_dupont_analysis(financials)
+    assert r["available"] is True
+    assert r["asset_turnover"] > 1.0
+    assert r["dominant_mode"] == "高周转"
+    print(f"✅ test_dupont_high_turnover_mode passed (mode={r['dominant_mode']}, 周转={r['asset_turnover']})")
+
+
+def test_dupont_high_leverage_mode():
+    """杜邦分析:高杠杆驱动(房企式)。权益乘数 > 5。"""
+    from fundamental import compute_dupont_analysis
+    # 房企式:净利率 8%,周转 0.3,权益乘数 8
+    financials = [
+        {"period": "20241231", "net_profit": 24, "revenue": 300,
+         "total_assets": 1000, "net_assets": 125, "roe": 19.2},
+    ]
+    r = compute_dupont_analysis(financials)
+    assert r["available"] is True
+    assert r["equity_multiplier"] > 5
+    assert r["dominant_mode"] == "高杠杆"
+    print(f"✅ test_dupont_high_leverage_mode passed (mode={r['dominant_mode']}, 权益乘数={r['equity_multiplier']})")
+
+
+def test_buffett_filter_all_pass():
+    """巴菲特三步全过:ROE 达标 + 资产负债率 < 50% + 现金流 ≥ 净利润。"""
+    from fundamental import compute_buffett_filter
+    financials = [
+        {"period": "20201231", "net_profit": 100, "revenue": 1000, "roe": 18,
+         "operating_cf": 110, "debt_ratio_pct": 35},
+        {"period": "20211231", "net_profit": 110, "revenue": 1100, "roe": 19,
+         "operating_cf": 115, "debt_ratio_pct": 33},
+        {"period": "20221231", "net_profit": 120, "revenue": 1200, "roe": 20,
+         "operating_cf": 125, "debt_ratio_pct": 32},
+        {"period": "20231231", "net_profit": 130, "revenue": 1300, "roe": 21,
+         "operating_cf": 135, "debt_ratio_pct": 30},
+        {"period": "20241231", "net_profit": 140, "revenue": 1400, "roe": 22,
+         "operating_cf": 145, "debt_ratio_pct": 28},
+    ]
+    r = compute_buffett_filter(financials)
+    assert r["step1_roe"]["pass"] is True
+    assert r["step2_debt"]["pass"] is True
+    assert r["step3_cashflow"]["pass"] is True
+    assert r["all_pass"] is True
+    print(f"✅ test_buffett_filter_all_pass passed (三步全过)")
+
+
+def test_buffett_filter_fail_high_debt():
+    """巴菲特筛选失败:资产负债率过高(>50%)。"""
+    from fundamental import compute_buffett_filter
+    financials = [
+        {"period": "20201231", "net_profit": 100, "revenue": 1000, "roe": 20,
+         "operating_cf": 110, "debt_ratio_pct": 65},
+        {"period": "20211231", "net_profit": 110, "revenue": 1100, "roe": 21,
+         "operating_cf": 115, "debt_ratio_pct": 68},
+    ]
+    r = compute_buffett_filter(financials)
+    assert r["step1_roe"]["pass"] is True
+    assert r["step2_debt"]["pass"] is False
+    assert r["all_pass"] is False
+    print(f"✅ test_buffett_filter_fail_high_debt passed (step2 fail: 资产负债率高)")
+
+
+def test_buffett_filter_fail_cashflow():
+    """巴菲特筛选失败:经营现金流 < 净利润(盈利质量差)。"""
+    from fundamental import compute_buffett_filter
+    financials = [
+        {"period": "20231231", "net_profit": 100, "revenue": 1000, "roe": 20,
+         "operating_cf": 50, "debt_ratio_pct": 30},
+    ]
+    r = compute_buffett_filter(financials)
+    assert r["step3_cashflow"]["pass"] is False
+    assert r["all_pass"] is False
+    print(f"✅ test_buffett_filter_fail_cashflow passed (step3 fail: 现金流不匹配)")
+
+
+def test_fake_roe_high_leverage_warning():
+    """假高 ROE:高杠杆驱动(权益乘数 > 5 + 净利率 < 10%)。"""
+    from fundamental import detect_fake_roe
+    financials = [
+        {"period": "20241231", "net_profit": 24, "revenue": 300,
+         "total_assets": 1000, "net_assets": 125, "operating_profit": 23, "net_profit_prev": 20, "net_assets_prev": 120},
+    ]
+    r = detect_fake_roe(financials)
+    assert r["is_fake"] is True
+    types = [w["type"] for w in r["warnings"]]
+    assert "high_leverage" in types
+    print(f"✅ test_fake_roe_high_leverage_warning passed (warnings: {types})")
+
+
+def test_fake_roe_one_shot_gain_warning():
+    """假高 ROE:一次性收益(扣非/NI < 0.7)。"""
+    from fundamental import detect_fake_roe
+    # 净利润 100,扣非只有 50(比率 0.5 < 0.7) - 卖资产凑利润
+    financials = [
+        {"period": "20241231", "net_profit": 100, "operating_profit": 50,
+         "revenue": 1000, "total_assets": 500, "net_assets": 300},
+    ]
+    r = detect_fake_roe(financials)
+    assert r["is_fake"] is True
+    types = [w["type"] for w in r["warnings"]]
+    assert "one_shot_gain" in types
+    print(f"✅ test_fake_roe_one_shot_gain_warning passed (warnings: {types})")
+
+
+def test_fake_roe_buyback_shrink_warning():
+    """假高 ROE:回购缩分母(净资产同比下降 + 净利润未下降)。"""
+    from fundamental import detect_fake_roe
+    # 上年净资产 200,今年 180(下降 10%);上年净利润 100,今年 110(上升)
+    financials = [
+        {"period": "20231231", "net_profit": 100, "net_assets": 200,
+         "revenue": 1000, "total_assets": 500},
+        {"period": "20241231", "net_profit": 110, "net_assets": 180,
+         "revenue": 1100, "total_assets": 520},
+    ]
+    r = detect_fake_roe(financials)
+    assert r["is_fake"] is True
+    types = [w["type"] for w in r["warnings"]]
+    assert "buyback_shrink" in types
+    print(f"✅ test_fake_roe_buyback_shrink_warning passed (warnings: {types})")
+
+
+def test_fake_roe_clean():
+    """健康 ROE:无假高 ROE 信号。"""
+    from fundamental import detect_fake_roe
+    # 茅台式:高净利率、低杠杆、扣非匹配、净资产增长
+    financials = [
+        {"period": "20231231", "net_profit": 500, "net_assets": 1500,
+         "revenue": 1000, "total_assets": 1800, "operating_profit": 490},
+        {"period": "20241231", "net_profit": 550, "net_assets": 1700,
+         "revenue": 1100, "total_assets": 2000, "operating_profit": 540},
+    ]
+    r = detect_fake_roe(financials)
+    assert r["is_fake"] is False
+    assert r["warning_count"] == 0
+    print(f"✅ test_fake_roe_clean passed (无警告,ROE 健康)")
+
+
+def test_analyze_fundamental_includes_roe_quality():
+    """端到端:analyze_fundamental 输出包含 roe_quality 字段。"""
+    from fundamental import analyze_fundamental
+    financials = [
+        {"period": "20201231", "net_profit": 100, "revenue": 1000, "roe": 18,
+         "operating_cf": 110, "debt_ratio_pct": 35, "total_assets": 500, "net_assets": 325,
+         "roic": 15, "fcf": 110, "gross_margin_pct": 60, "operating_profit": 95},
+        {"period": "20211231", "net_profit": 110, "revenue": 1100, "roe": 19,
+         "operating_cf": 115, "debt_ratio_pct": 33, "total_assets": 540, "net_assets": 365,
+         "roic": 16, "fcf": 115, "gross_margin_pct": 61, "operating_profit": 105},
+        {"period": "20221231", "net_profit": 120, "revenue": 1200, "roe": 20,
+         "operating_cf": 125, "debt_ratio_pct": 32, "total_assets": 580, "net_assets": 400,
+         "roic": 17, "fcf": 125, "gross_margin_pct": 62, "operating_profit": 115},
+        {"period": "20231231", "net_profit": 130, "revenue": 1300, "roe": 21,
+         "operating_cf": 135, "debt_ratio_pct": 30, "total_assets": 620, "net_assets": 435,
+         "roic": 18, "fcf": 135, "gross_margin_pct": 63, "operating_profit": 125},
+        {"period": "20241231", "net_profit": 140, "revenue": 1400, "roe": 22,
+         "operating_cf": 145, "debt_ratio_pct": 28, "total_assets": 660, "net_assets": 475,
+         "roic": 19, "fcf": 145, "gross_margin_pct": 64, "operating_profit": 135},
+    ]
+    r = analyze_fundamental("600519", "贵州茅台", "食品饮料", pe=30, pb=10, financials=financials)
+    assert "roe_quality" in r
+    rq = r["roe_quality"]
+    assert "roe_stability" in rq
+    assert "dupont" in rq
+    assert "buffett_filter" in rq
+    assert "fake_roe" in rq
+    assert rq["roe_stability"]["buffett_filter"]["pass"] is True
+    assert rq["buffett_filter"]["all_pass"] is True
+    assert rq["fake_roe"]["is_fake"] is False
+    print(f"✅ test_analyze_fundamental_includes_roe_quality passed (ROE 均 {rq['roe_stability']['mean']}%, 巴菲特全过)")
+
+
 # ===== 筹码换手率衰减 + 底仓追踪 + ASR/CYQK 测试 =====
 
 def test_chip_decay_turnover_mode():
@@ -1114,6 +1343,20 @@ if __name__ == "__main__":
     test_bank_quality_weak_bank()
     test_bank_quality_pb_valuation_anchor()
     test_bank_quality_pb_missing()
+    test_roe_stability_buffett_pass()
+    test_roe_stability_buffett_fail_low_mean()
+    test_roe_stability_buffett_fail_low_min()
+    test_dupont_high_margin_mode()
+    test_dupont_high_turnover_mode()
+    test_dupont_high_leverage_mode()
+    test_buffett_filter_all_pass()
+    test_buffett_filter_fail_high_debt()
+    test_buffett_filter_fail_cashflow()
+    test_fake_roe_high_leverage_warning()
+    test_fake_roe_one_shot_gain_warning()
+    test_fake_roe_buyback_shrink_warning()
+    test_fake_roe_clean()
+    test_analyze_fundamental_includes_roe_quality()
     test_chip_decay_turnover_mode()
     test_chip_decay_fixed_fallback()
     test_asr_indicator()
