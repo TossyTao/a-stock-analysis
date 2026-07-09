@@ -960,6 +960,7 @@ def analyze_bank_quality(
     pe: Optional[float],
     pb: Optional[float],
     financials: List[Dict[str, Any]],
+    research_reports: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """银行股专用分析:用 ROE 替代 ROIC,PB/股息率替代 PE。
 
@@ -1071,6 +1072,11 @@ def analyze_bank_quality(
         "note": "银行股天然受政策强烈影响,需跟踪息差/不良/房地产",
     }
 
+    # 机构研报评估
+    research_report = summarize_research_report(research_reports)
+    if research_report.get("available"):
+        evidence = research_report["evidence"] + evidence
+
     return {
         "code": code,
         "name": name,
@@ -1084,11 +1090,129 @@ def analyze_bank_quality(
             "roe_stability": roe_stability,
             "profit_growth": profit_growth,
             "revenue_growth": revenue_growth,
+            "research_quality": {
+                "quality_signal": research_report.get("quality_signal"),
+                "total_reports": research_report.get("total_reports"),
+                "rating_consensus": research_report.get("rating_consensus"),
+                "target_price": research_report.get("target_price"),
+                "foreign_summary": research_report.get("foreign_summary"),
+                "divergence": research_report.get("divergence"),
+            } if research_report.get("available") else {},
             "note": "银行股专用分析,不适用 ROIC/FCF/PE 陷阱框架",
         },
         "pe_trap": pe_trap,
         "investment_approach": approach,
         "geopolitical_risk": geopolitical_risk,
+        "research_report": research_report,
+    }
+
+
+def summarize_research_report(reports_data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """把 fetch_research_reports 的输出翻译成公司质地维度的评估摘要。
+
+    返回:
+    {
+        "available": bool,
+        "rating_consensus": {...},    # 评级共识(主导评级 + 强度)
+        "target_price": {...},        # 目标价(均值 + 上涨空间 + 标签)
+        "foreign_summary": {...},     # 外资观点
+        "divergence": {...},          # 外资 vs 内资分歧
+        "evidence": [str, ...],       # 给 classification.evidence 用的证据列表
+        "quality_signal": str,        # 机构认可度信号: 强 / 中 / 弱 / 无覆盖
+    }
+    """
+    if not reports_data or reports_data.get("error") or not reports_data.get("available", True):
+        return {
+            "available": False,
+            "evidence": ["无机构研报覆盖或拉取失败"],
+            "quality_signal": "无覆盖",
+        }
+    if reports_data.get("total_reports", 0) == 0:
+        return {
+            "available": False,
+            "evidence": ["无机构研报覆盖"],
+            "quality_signal": "无覆盖",
+        }
+
+    total = reports_data.get("total_reports", 0)
+    rc = reports_data.get("rating_consensus", {})
+    tp = reports_data.get("target_price", {})
+    fs = reports_data.get("foreign_summary", {})
+    div = reports_data.get("divergence", {})
+    eps_f = reports_data.get("eps_forecast", {})
+
+    evidence: List[str] = []
+
+    # 评级共识
+    if rc.get("available"):
+        dominant_label = rc.get("dominant_label", "未明")
+        dominant_pct = rc.get("dominant_pct", 0)
+        strength_label = rc.get("label", "")
+        evidence.append(
+            f"机构评级共识:{dominant_label}({dominant_pct}%)/{strength_label},共 {rc.get('total', 0)} 篇研报"
+        )
+
+    # 目标价
+    if tp.get("available"):
+        mean = tp.get("mean")
+        upside = tp.get("upside_pct")
+        label = tp.get("label")
+        if upside is not None:
+            evidence.append(f"目标价均值 {mean}(相对当前价 {upside:+.1f}%/{label})")
+        else:
+            evidence.append(f"目标价均值 {mean}(无当前价对比)")
+
+    # 外资观点
+    if fs.get("available"):
+        fcount = fs.get("count", 0)
+        f_rc = fs.get("rating_consensus", {})
+        f_latest = fs.get("latest", {}) or {}
+        if f_rc.get("available"):
+            evidence.append(
+                f"外资/港资/台资合资券商 {fcount} 篇,共识 {f_rc.get('dominant_label', '未明')}"
+                f"({f_rc.get('dominant_pct', 0)}%)"
+            )
+        if f_latest.get("org"):
+            evidence.append(
+                f"最近外资研报:{f_latest.get('org')} {f_latest.get('date')} "
+                f"评级 {f_latest.get('rating') or '未明'}"
+            )
+
+    # 分歧度
+    if div.get("available"):
+        evidence.append(f"内外资分歧:{div.get('label', '未明')}")
+
+    # 盈利预测
+    if eps_f.get("available"):
+        cur = eps_f.get("current_year", {}) or {}
+        nxt = eps_f.get("next_year", {}) or {}
+        if cur.get("eps") is not None and nxt.get("eps") is not None:
+            growth = (nxt["eps"] - cur["eps"]) / cur["eps"] if cur["eps"] else 0
+            evidence.append(
+                f"盈利预测:今年 EPS {cur.get('eps')} / 明年 {nxt.get('eps')}"
+                f"(同比 {growth*100:+.1f}%)"
+            )
+
+    # 机构认可度信号:强(≥10 篇 + 共识强) / 中(≥5 篇 + 共识中以上) / 弱(<5 篇) / 无覆盖(0)
+    if total >= 10 and rc.get("label") in ("共识强",):
+        quality_signal = "强"
+    elif total >= 5 and rc.get("consensus_strength", 0) >= 0.5:
+        quality_signal = "中"
+    elif total >= 1:
+        quality_signal = "弱"
+    else:
+        quality_signal = "无覆盖"
+
+    return {
+        "available": True,
+        "total_reports": total,
+        "rating_consensus": rc,
+        "target_price": tp,
+        "foreign_summary": fs,
+        "divergence": div,
+        "eps_forecast": eps_f,
+        "evidence": evidence,
+        "quality_signal": quality_signal,
     }
 
 
@@ -1099,6 +1223,7 @@ def analyze_fundamental(
     pe: Optional[float],
     pb: Optional[float],
     financials: List[Dict[str, Any]],
+    research_reports: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """主入口:综合公司质地分析。
 
@@ -1190,6 +1315,21 @@ def analyze_fundamental(
     pe_trap = detect_pe_trap(classification["type"], pe, profit_growth)
     approach = investment_approach(classification["type"])
 
+    # 机构研报评估:评级共识 + 目标价 + 外资观点 + 分歧度
+    research_report = summarize_research_report(research_reports)
+    if research_report.get("available"):
+        classification["evidence"] = (
+            research_report["evidence"] + classification.get("evidence", [])
+        )
+        classification["research_quality"] = {
+            "quality_signal": research_report.get("quality_signal"),
+            "total_reports": research_report.get("total_reports"),
+            "rating_consensus": research_report.get("rating_consensus"),
+            "target_price": research_report.get("target_price"),
+            "foreign_summary": research_report.get("foreign_summary"),
+            "divergence": research_report.get("divergence"),
+        }
+
     return {
         "code": code,
         "name": name,
@@ -1206,4 +1346,5 @@ def analyze_fundamental(
             "buffett_filter": buffett,
             "fake_roe": fake_roe,
         },
+        "research_report": research_report,
     }

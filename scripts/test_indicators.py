@@ -1266,6 +1266,360 @@ def test_recompute_chip_with_float():
     print(f"✅ test_recompute_chip_with_float passed (decay_mode={indicators['chip']['decay_meta']['decay_mode']}, ASR={indicators['chip']['asr']['value']:.1f}%)")
 
 
+# ===== 机构研报评估 测试 =====
+
+def test_is_foreign_broker_keywords():
+    """外资/港资/台资券商识别:关键词匹配。"""
+    from fetch_research_reports import is_foreign_broker
+    assert is_foreign_broker("高盛高华证券") is True
+    assert is_foreign_broker("瑞银证券") is True
+    assert is_foreign_broker("摩根士丹利华鑫") is True
+    assert is_foreign_broker("中银国际") is True
+    assert is_foreign_broker("招银国际") is True
+    assert is_foreign_broker("群益证券") is True
+    assert is_foreign_broker("汇丰前海证券") is True
+    assert is_foreign_broker("野村东方国际") is True
+    # 内资券商
+    assert is_foreign_broker("中信证券") is False
+    assert is_foreign_broker("国泰君安") is False
+    assert is_foreign_broker("华泰证券") is False
+    assert is_foreign_broker("东方财富证券") is False
+    # 空值
+    assert is_foreign_broker("") is False
+    assert is_foreign_broker(None) is False
+    print("✅ test_is_foreign_broker_keywords passed")
+
+
+def test_normalize_rating():
+    """评级标准化:东财评级 -> 标准化标签。"""
+    from fetch_research_reports import normalize_rating
+    assert normalize_rating("买入") == "buy"
+    assert normalize_rating("增持") == "overweight"
+    assert normalize_rating("推荐") == "overweight"
+    assert normalize_rating("中性") == "neutral"
+    assert normalize_rating("持有") == "neutral"
+    assert normalize_rating("减持") == "reduce"
+    assert normalize_rating("卖出") == "sell"
+    assert normalize_rating("回避") == "sell"
+    assert normalize_rating("") == "unknown"
+    assert normalize_rating("未知评级") == "unknown"
+    assert normalize_rating(None) == "unknown"
+    print("✅ test_normalize_rating passed")
+
+
+def test_rating_consensus_strong():
+    """评级共识:主导评级占多数 = 共识强。"""
+    from fetch_research_reports import _compute_rating_consensus
+    reports = [
+        {"rating_norm": "buy"},
+        {"rating_norm": "buy"},
+        {"rating_norm": "buy"},
+        {"rating_norm": "buy"},
+        {"rating_norm": "buy"},
+        {"rating_norm": "buy"},
+        {"rating_norm": "buy"},
+        {"rating_norm": "buy"},
+        {"rating_norm": "overweight"},
+        {"rating_norm": "overweight"},
+        {"rating_norm": "overweight"},
+    ]
+    rc = _compute_rating_consensus(reports)
+    assert rc["available"] is True
+    assert rc["total"] == 11
+    assert rc["dominant"] == "buy"
+    assert rc["dominant_label"] == "买入"
+    assert rc["dominant_pct"] == 72.7
+    assert rc["label"] == "共识强"
+    assert rc["score_mean"] == 1.73  # (8*2 + 3*1) / 11 = 19/11
+    print(f"✅ test_rating_consensus_strong passed (主导 {rc['dominant_label']} {rc['dominant_pct']}%/{rc['label']})")
+
+
+def test_rating_consensus_divergent():
+    """评级共识:评级分散 = 分歧大。"""
+    from fetch_research_reports import _compute_rating_consensus
+    reports = [
+        {"rating_norm": "buy"},
+        {"rating_norm": "overweight"},
+        {"rating_norm": "neutral"},
+        {"rating_norm": "reduce"},
+    ]
+    rc = _compute_rating_consensus(reports)
+    assert rc["available"] is True
+    assert rc["label"] == "分歧大"
+    assert rc["consensus_strength"] == 0.25
+    print(f"✅ test_rating_consensus_divergent passed ({rc['label']}, 强度 {rc['consensus_strength']})")
+
+
+def test_target_price_with_upside():
+    """目标价统计:含上涨空间计算。"""
+    from fetch_research_reports import _compute_target_price
+    reports = [
+        {"aim_price": 1500.0},
+        {"aim_price": 1600.0},
+        {"aim_price": 1700.0},
+        {"aim_price": 1800.0},
+        {"aim_price": 1900.0},
+    ]
+    tp = _compute_target_price(reports, current_price=1500.0)
+    assert tp["available"] is True
+    assert tp["count"] == 5
+    assert tp["mean"] == 1700.0
+    assert tp["max"] == 1900.0
+    assert tp["min"] == 1500.0
+    assert tp["upside_pct"] == 13.3
+    assert tp["label"] == "空间中"
+    print(f"✅ test_target_price_with_upside passed (mean {tp['mean']}, upside {tp['upside_pct']}%/{tp['label']})")
+
+
+def test_target_price_no_current():
+    """目标价统计:无当前价时 upside 为 None。"""
+    from fetch_research_reports import _compute_target_price
+    reports = [{"aim_price": 100.0}, {"aim_price": 120.0}]
+    tp = _compute_target_price(reports, current_price=None)
+    assert tp["available"] is True
+    assert tp["mean"] == 110.0
+    assert tp["upside_pct"] is None
+    print(f"✅ test_target_price_no_current passed (mean {tp['mean']}, upside None)")
+
+
+def test_eps_forecast_latest():
+    """盈利预测:取最近有预测的研报。"""
+    from fetch_research_reports import _compute_eps_forecast
+    reports = [
+        {"publish_date": "2026-05-25", "org": "诚通证券",
+         "eps_this_year": 66.68, "pe_this_year": 19.8,
+         "eps_next_year": 69.43, "pe_next_year": 19.1,
+         "eps_year_after_next": 72.56, "pe_year_after_next": 18.2},
+        {"publish_date": "2026-04-01", "org": "群益证券",
+         "eps_this_year": 68.0, "pe_this_year": 20.0,
+         "eps_next_year": 70.0, "pe_next_year": 19.5,
+         "eps_year_after_next": None, "pe_year_after_next": None},
+    ]
+    ef = _compute_eps_forecast(reports)
+    assert ef["available"] is True
+    assert ef["current_year"]["eps"] == 66.68
+    assert ef["current_year"]["org"] == "诚通证券"
+    assert ef["next_year"]["eps"] == 69.43
+    assert ef["year_after_next"]["eps"] == 72.56
+    print(f"✅ test_eps_forecast_latest passed (今年 EPS {ef['current_year']['eps']}, 明年 {ef['next_year']['eps']})")
+
+
+def test_foreign_summary():
+    """外资汇总:外资研报数 + 共识 + 最近一条。"""
+    from fetch_research_reports import _compute_foreign_summary
+    foreign_reports = [
+        {"org": "群益证券", "is_foreign": True, "publish_date": "2026-04-28",
+         "rating": "持有", "rating_norm": "neutral", "aim_price": 1525.0,
+         "title": "转型初见成效"},
+        {"org": "群益证券", "is_foreign": True, "publish_date": "2026-01-09",
+         "rating": "持有", "rating_norm": "neutral", "aim_price": None,
+         "title": "春节前投放"},
+    ]
+    fs = _compute_foreign_summary(foreign_reports, current_price=1700.0)
+    assert fs["available"] is True
+    assert fs["count"] == 2
+    assert fs["rating_consensus"]["dominant"] == "neutral"
+    assert fs["latest"]["org"] == "群益证券"
+    assert fs["latest"]["rating"] == "持有"
+    print(f"✅ test_foreign_summary passed (count {fs['count']}, 共识 {fs['rating_consensus']['dominant_label']})")
+
+
+def test_divergence_foreign_pessimistic():
+    """分歧度:外资明显更悲观。"""
+    from fetch_research_reports import _compute_divergence
+    reports = [
+        {"is_foreign": True, "rating_norm": "neutral"},
+        {"is_foreign": True, "rating_norm": "neutral"},
+        {"is_foreign": True, "rating_norm": "neutral"},
+        {"is_foreign": False, "rating_norm": "buy"},
+        {"is_foreign": False, "rating_norm": "buy"},
+        {"is_foreign": False, "rating_norm": "buy"},
+        {"is_foreign": False, "rating_norm": "buy"},
+        {"is_foreign": False, "rating_norm": "buy"},
+    ]
+    foreign_reports = [r for r in reports if r.get("is_foreign")]
+    div = _compute_divergence(reports, foreign_reports)
+    assert div["available"] is True
+    assert div["foreign_score"] == 0.0
+    assert div["domestic_score"] == 2.0
+    assert div["diff"] == -2.0
+    assert div["label"] == "外资明显更悲观"
+    print(f"✅ test_divergence_foreign_pessimistic passed ({div['label']}, diff {div['diff']})")
+
+
+def test_divergence_consistent():
+    """分歧度:内外资一致。"""
+    from fetch_research_reports import _compute_divergence
+    reports = [
+        {"is_foreign": True, "rating_norm": "buy"},
+        {"is_foreign": True, "rating_norm": "buy"},
+        {"is_foreign": False, "rating_norm": "buy"},
+        {"is_foreign": False, "rating_norm": "buy"},
+    ]
+    foreign_reports = [r for r in reports if r.get("is_foreign")]
+    div = _compute_divergence(reports, foreign_reports)
+    assert div["available"] is True
+    assert div["diff"] == 0.0
+    assert div["label"] == "内外资一致"
+    print(f"✅ test_divergence_consistent passed ({div['label']})")
+
+
+def test_summarize_research_report_empty():
+    """研报评估摘要:空数据降级。"""
+    from fundamental import summarize_research_report
+    # None
+    r = summarize_research_report(None)
+    assert r["available"] is False
+    assert r["quality_signal"] == "无覆盖"
+    # error
+    r = summarize_research_report({"error": "网络错误", "total_reports": 0})
+    assert r["available"] is False
+    assert r["quality_signal"] == "无覆盖"
+    # total 0
+    r = summarize_research_report({"total_reports": 0, "reports": []})
+    assert r["available"] is False
+    print("✅ test_summarize_research_report_empty passed")
+
+
+def test_summarize_research_report_strong():
+    """研报评估摘要:≥10 篇 + 共识强 = 机构认可度强。"""
+    from fundamental import summarize_research_report
+    reports_data = {
+        "total_reports": 11,
+        "rating_consensus": {
+            "available": True, "total": 11, "dominant": "buy", "dominant_label": "买入",
+            "dominant_pct": 72.7, "label": "共识强", "consensus_strength": 0.727, "score_mean": 1.73,
+        },
+        "target_price": {"available": False},
+        "foreign_summary": {"available": False, "count": 0},
+        "divergence": {"available": False},
+        "eps_forecast": {
+            "available": True,
+            "current_year": {"eps": 1.73, "pe": 22.73},
+            "next_year": {"eps": 2.01, "pe": 19.5},
+            "year_after_next": {"eps": 2.32, "pe": 16.96},
+        },
+    }
+    r = summarize_research_report(reports_data)
+    assert r["available"] is True
+    assert r["quality_signal"] == "强"
+    assert r["total_reports"] == 11
+    assert any("机构评级共识" in e for e in r["evidence"])
+    assert any("盈利预测" in e for e in r["evidence"])
+    print(f"✅ test_summarize_research_report_strong passed (quality={r['quality_signal']}, evidence {len(r['evidence'])} 条)")
+
+
+def test_summarize_research_report_weak():
+    """研报评估摘要:<5 篇 = 机构认可度弱。"""
+    from fundamental import summarize_research_report
+    reports_data = {
+        "total_reports": 2,
+        "rating_consensus": {
+            "available": True, "total": 2, "dominant": "buy", "dominant_label": "买入",
+            "dominant_pct": 100.0, "label": "共识强", "consensus_strength": 1.0, "score_mean": 2.0,
+        },
+        "target_price": {"available": False},
+        "foreign_summary": {"available": False, "count": 0},
+        "divergence": {"available": False},
+        "eps_forecast": {"available": False},
+    }
+    r = summarize_research_report(reports_data)
+    assert r["available"] is True
+    assert r["quality_signal"] == "弱"
+    print(f"✅ test_summarize_research_report_weak passed (quality={r['quality_signal']})")
+
+
+def test_analyze_fundamental_with_research_reports():
+    """端到端:analyze_fundamental 接收 research_reports 参数,输出 research_report 字段并写入 evidence。"""
+    from fundamental import analyze_fundamental
+    financials = [
+        {"period": "20201231", "net_profit": 100, "revenue": 1000, "roe": 18,
+         "operating_cf": 110, "debt_ratio_pct": 35, "total_assets": 500, "net_assets": 325,
+         "roic": 15, "fcf": 110, "gross_margin_pct": 60, "operating_profit": 95},
+        {"period": "20211231", "net_profit": 110, "revenue": 1100, "roe": 19,
+         "operating_cf": 115, "debt_ratio_pct": 33, "total_assets": 540, "net_assets": 365,
+         "roic": 16, "fcf": 115, "gross_margin_pct": 61, "operating_profit": 105},
+        {"period": "20221231", "net_profit": 120, "revenue": 1200, "roe": 20,
+         "operating_cf": 125, "debt_ratio_pct": 32, "total_assets": 580, "net_assets": 400,
+         "roic": 17, "fcf": 125, "gross_margin_pct": 62, "operating_profit": 115},
+        {"period": "20231231", "net_profit": 130, "revenue": 1300, "roe": 21,
+         "operating_cf": 135, "debt_ratio_pct": 30, "total_assets": 620, "net_assets": 435,
+         "roic": 18, "fcf": 135, "gross_margin_pct": 63, "operating_profit": 125},
+        {"period": "20241231", "net_profit": 140, "revenue": 1400, "roe": 22,
+         "operating_cf": 145, "debt_ratio_pct": 28, "total_assets": 660, "net_assets": 475,
+         "roic": 19, "fcf": 145, "gross_margin_pct": 64, "operating_profit": 135},
+    ]
+    research_reports = {
+        "total_reports": 15,
+        "rating_consensus": {
+            "available": True, "total": 15, "dominant": "buy", "dominant_label": "买入",
+            "dominant_pct": 80.0, "label": "共识强", "consensus_strength": 0.8, "score_mean": 1.8,
+        },
+        "target_price": {
+            "available": True, "count": 5, "mean": 1850.0, "median": 1800.0,
+            "max": 2200.0, "min": 1500.0, "spread_pct": 37.8,
+            "current_price": 1700.0, "upside_pct": 8.8, "label": "空间中",
+        },
+        "foreign_summary": {
+            "available": True, "count": 3,
+            "rating_consensus": {
+                "available": True, "total": 3, "dominant": "neutral", "dominant_label": "中性",
+                "dominant_pct": 100.0, "label": "共识强", "consensus_strength": 1.0, "score_mean": 0.0,
+            },
+            "target_price": {"available": False},
+            "latest": {"title": "test", "org": "群益证券", "date": "2026-04-28",
+                       "rating": "持有", "rating_norm": "neutral", "aim_price": 1525.0},
+        },
+        "divergence": {
+            "available": True, "foreign_score": 0.0, "domestic_score": 2.0,
+            "diff": -2.0, "label": "外资明显更悲观",
+            "foreign_target_price": None, "domestic_target_price": 1900.0,
+            "target_price_divergence_pct": None,
+        },
+        "eps_forecast": {
+            "available": True,
+            "current_year": {"eps": 66.68, "pe": 19.8},
+            "next_year": {"eps": 69.43, "pe": 19.1},
+            "year_after_next": {"eps": 72.56, "pe": 18.2},
+        },
+    }
+    r = analyze_fundamental("600519", "贵州茅台", "食品饮料", pe=30, pb=10,
+                            financials=financials, research_reports=research_reports)
+    assert "research_report" in r
+    rr = r["research_report"]
+    assert rr["available"] is True
+    assert rr["quality_signal"] == "强"
+    assert rr["total_reports"] == 15
+    # evidence 含研报共识
+    ev = r["classification"]["evidence"]
+    assert any("机构评级共识" in e for e in ev)
+    assert any("目标价均值" in e for e in ev)
+    assert any("外资" in e for e in ev)
+    assert any("内外资分歧" in e for e in ev)
+    # research_quality 字段
+    rq = r["classification"].get("research_quality", {})
+    assert rq.get("quality_signal") == "强"
+    assert rq.get("total_reports") == 15
+    print(f"✅ test_analyze_fundamental_with_research_reports passed (quality={rr['quality_signal']}, evidence {len(ev)} 条)")
+
+
+def test_analyze_fundamental_no_research_reports():
+    """端到端:不传 research_reports 时,research_report.available=False 但不报错。"""
+    from fundamental import analyze_fundamental
+    financials = [
+        {"period": "20231231", "net_profit": 100, "revenue": 1000, "roe": 18,
+         "operating_cf": 110, "debt_ratio_pct": 35, "total_assets": 500, "net_assets": 325,
+         "roic": 15, "fcf": 110, "gross_margin_pct": 60, "operating_profit": 95},
+        {"period": "20241231", "net_profit": 110, "revenue": 1100, "roe": 19,
+         "operating_cf": 115, "debt_ratio_pct": 33, "total_assets": 540, "net_assets": 365,
+         "roic": 16, "fcf": 115, "gross_margin_pct": 61, "operating_profit": 105},
+    ]
+    r = analyze_fundamental("600519", "贵州茅台", "食品饮料", pe=30, pb=10, financials=financials)
+    assert "research_report" in r
+    assert r["research_report"]["available"] is False
+    print("✅ test_analyze_fundamental_no_research_reports passed")
+
+
 if __name__ == "__main__":
     test_position_percentile()
     test_position_label()
@@ -1367,4 +1721,20 @@ if __name__ == "__main__":
     test_enhanced_pattern_top_signal()
     test_chip_analyze_with_float()
     test_recompute_chip_with_float()
+    # 机构研报评估
+    test_is_foreign_broker_keywords()
+    test_normalize_rating()
+    test_rating_consensus_strong()
+    test_rating_consensus_divergent()
+    test_target_price_with_upside()
+    test_target_price_no_current()
+    test_eps_forecast_latest()
+    test_foreign_summary()
+    test_divergence_foreign_pessimistic()
+    test_divergence_consistent()
+    test_summarize_research_report_empty()
+    test_summarize_research_report_strong()
+    test_summarize_research_report_weak()
+    test_analyze_fundamental_with_research_reports()
+    test_analyze_fundamental_no_research_reports()
     print("\n🎉 All tests passed!")

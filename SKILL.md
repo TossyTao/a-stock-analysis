@@ -228,7 +228,63 @@ python3 analyze.py 000001 --no-fundamental  # 跳过基本面(网络差时)
 
 **ROE 稳定性**(`roe_quality.roe_stability`):均值/min/max/cv/趋势 + `buffett_filter`(均>15% + 单年≥12%)。带季节性调整(优先用年报数据)。
 
-### 3.7 投资思路(从 `fundamental.investment_approach` 读取)
+### 3.7 机构研报评估(市场观点 + 外资分歧)
+
+从 `fundamental.research_report` 读取。数据来自东方财富研报中心(reportapi.eastmoney.com),聚合 A 股研报评级/目标价/盈利预测,并识别外资/港资/台资合资券商观点。
+
+**评级共识**(`research_report.rating_consensus`):
+
+| 共识强度 | 主导评级占比 | 含义 |
+|---------|-------------|------|
+| 共识强 | ≥60% | 主导评级可信,作为参考 |
+| 共识中 | 40-60% | 分歧存在,谨慎参考 |
+| 分歧大 | <40% | 机构观点分裂,警惕 |
+
+主导评级 (`dominant_label`):买入 / 增持 / 中性 / 减持 / 卖出。`score_mean` = 评级分数均值(buy=2, overweight=1, neutral=0, reduce=-1, sell=-2)。
+
+**目标价空间**(`research_report.target_price`):
+
+| 标签 | 上涨空间 | 含义 |
+|------|---------|------|
+| 空间大 | ≥20% | 机构看多,但需防一致预期陷阱 |
+| 空间中 | 5-20% | 中性偏多 |
+| 空间小 | -5% ~ 5% | 已接近目标价 |
+| 已超目标 | ≤-5% | 已透支机构预期,警惕 |
+
+`spread_pct` = (max-min)/mean,反映机构对目标价的分歧度。
+
+**外资观点**(`research_report.foreign_summary`):识别外资/港资/台资合资券商研报,聚合外资评级共识 + 最近一条外资研报。
+
+外资券商识别(关键词匹配 `orgSName`):
+- 国际投行在华合资:高盛高华、瑞银证券、摩根士丹利华鑫、瑞信方正、野村东方国际
+- 中资国际子公司:中银国际、招银国际、建银国际、交银国际、海通国际、华泰国际
+- 港台资:群益、元大、凯基、第一上海、汇丰前海
+
+**内外资分歧**(`research_report.divergence`):
+
+| 标签 | 评分差 | 含义 |
+|------|-------|------|
+| 外资明显更乐观 | diff ≥ 1.0 | 外资比内资更看多 |
+| 外资略乐观 | 0.5 ≤ diff < 1.0 | 外资略偏多 |
+| 内外资一致 | |diff| < 0.5 | 观点一致 |
+| 外资略悲观 | -1.0 < diff ≤ -0.5 | 外资略偏空 |
+| 外资明显更悲观 | diff ≤ -1.0 | 外资比内资更看空 |
+
+`diff = foreign_score - domestic_score`。`target_price_divergence_pct` = 外资目标价均值相对内资目标价均值的偏离百分比。
+
+**机构认可度信号**(`research_report.quality_signal`):
+- `强`:≥10 篇研报 + 共识强(主导评级 ≥60%)
+- `中`:≥5 篇 + 共识强度 ≥50%
+- `弱`:<5 篇
+- `无覆盖`:0 篇
+
+**盈利预测**(`research_report.eps_forecast`):取最近有预测的研报,输出今年/明年/后年 EPS/PE。
+
+**证据已写入 `classification.evidence`**(评级共识 / 目标价 / 外资观点 / 分歧 / 盈利预测 各一条)。
+
+**局限**:免费接口只能拿到东财研报中心数据(合资券商中文研报)。真正的高盛/摩根/瑞银/野村英文原版研报需付费终端(Wind/Choice/Bloomberg/Refinitiv)。
+
+### 3.8 投资思路(从 `fundamental.investment_approach` 读取)
 
 | 类型 | 思路 | 操作 |
 |------|------|------|
@@ -336,7 +392,7 @@ CYQK 获利比例:{cyqk.win_ratio}%({cyqk.label}) - {cyqk.interpretation}
 底仓追踪:底仓价 {bottom_retention.bottom_peak_price} / 保留率 {retention_ratio} / 涨幅 {price_rise_pct} -> {signal}
 解读:{chip.pattern.interpretation}
 
-## 四、公司质地判断(含 ROE 深度分析)
+## 四、公司质地判断(含 ROE 深度 + 机构研报)
 类型:{fundamental.classification.type}
 行业:{industry} / PE:{pe} / PB:{pb}
 判定依据:{classification.evidence}(逐条列)
@@ -348,6 +404,13 @@ ROIC:{roic.mean}({roic.trend},cv={roic.cv}) / 利润增长:{profit_growth.all_po
 - 杜邦:净利率 {dupont.net_margin}% × 周转 {dupont.asset_turnover} × 权益乘数 {dupont.equity_multiplier} -> {dupont.mode_label}
 - 巴菲特三步:ROE {buffett_filter.step1_roe.pass} / 负债 {buffett_filter.step2_debt.pass} / 现金流 {buffett_filter.step3_cashflow.pass} / 全过 {buffett_filter.all_pass}
 - 假高 ROE 识别:{fake_roe.is_fake or "无警告"} - {fake_roe.interpretation}
+**机构研报评估**:
+- 评级共识:{rating_consensus.dominant_label}({rating_consensus.dominant_pct}%)/{rating_consensus.label},共 {rating_consensus.total} 篇(score_mean {rating_consensus.score_mean})
+- 目标价:均值 {target_price.mean}(相对当前价 {target_price.upside_pct}%/{target_price.label}),区间 {target_price.min}-{target_price.max}(spread {target_price.spread_pct}%)
+- 外资观点:{foreign_summary.count} 篇外资合资券商研报,共识 {foreign_summary.rating_consensus.dominant_label};最近 {foreign_summary.latest.org} {foreign_summary.latest.date} 评级 {foreign_summary.latest.rating}
+- 内外资分歧:{divergence.label}(评分差 {divergence.diff},目标价偏离 {divergence.target_price_divergence_pct}%)
+- 盈利预测:今年 EPS {eps_forecast.current_year.eps}(PE {eps_forecast.current_year.pe}) / 明年 {eps_forecast.next_year.eps}(PE {eps_forecast.next_year.pe})
+- 机构认可度:{quality_signal}(强/中/弱/无覆盖)
 
 ## 五、政治/地缘/政策风险评估
 风险敞口:{geopolitical_risk.risk_types}(逐条列,无则"无明显风险敞口")
@@ -383,19 +446,21 @@ ROIC:{roic.mean}({roic.trend},cv={roic.cv}) / 利润增长:{profit_growth.all_po
 
 ## 综合判断要点
 
-- **强买(成长):** 成长股 + 低位 + 低位单峰 + 5日量增价涨(强度中+) + 金叉 + 五步全过 + 政治风险低 -> 长期持有
-- **强买(成长叙事强化):** 成长(叙事强化) + 低位 + 营收+扣非持续增长 + 量价确认 + 政治风险低 -> 长期持有,逢低加仓
-- **强买(周期):** 周期股 + 行业亏损/PE 极高 + 底背离 + 5日低位放量 + 海外资产无地缘风险 -> 波段布局
-- **关注(周期有成长潜力):** 周期(有成长潜力) + 低位 + 行业叙事 + Q2/Q3 营收+扣非验证 -> 波段为主,业绩兑现后转长期持有
-- **强卖(成长):** 成长股 + 高位 + 顶背离 + 5日缩量 + ROIC 拐头 -> 减仓
-- **强卖(周期):** 周期股 + PE 极低 + 利润暴增 + 高位单峰 -> 立即逃顶
+- **强买(成长):** 成长股 + 低位 + 低位单峰 + 5日量增价涨(强度中+) + 金叉 + 五步全过 + 政治风险低 + 机构认可度强/中 + 目标价空间中以上 -> 长期持有
+- **强买(成长叙事强化):** 成长(叙事强化) + 低位 + 营收+扣非持续增长 + 量价确认 + 政治风险低 + 机构共识强 -> 长期持有,逢低加仓
+- **强买(周期):** 周期股 + 行业亏损/PE 极高 + 底背离 + 5日低位放量 + 海外资产无地缘风险 + 外资不悲观 -> 波段布局
+- **关注(周期有成长潜力):** 周期(有成长潜力) + 低位 + 行业叙事 + Q2/Q3 营收+扣非验证 + 机构共识强 -> 波段为主,业绩兑现后转长期持有
+- **强卖(成长):** 成长股 + 高位 + 顶背离 + 5日缩量 + ROIC 拐头 + 目标价已超目标 -> 减仓
+- **强卖(周期):** 周期股 + PE 极低 + 利润暴增 + 高位单峰 + 机构共识强(一致预期陷阱) -> 立即逃顶
 - **强卖(政治风险兑现):** 海外资产已减值 / 被列入实体清单 / 政策依赖退坡且无对冲 -> 立即离场,不等技术面
+- **强卖(外资分歧):** 外资明显更悲观 + 内资一致看多 + 高位 + 量价顶背离 -> 警惕外资先跑,减仓
 - **拐点警示:** 5日趋势与单日象限不一致(如5日涨但今日量缩价跌) -> 可能见顶/见底,等确认
 - **波段做T:** 双峰 + 当前价在两峰之间 -> 高抛低吸
 - **回避:** 伪成长(ROIC 下滑 + FCF 差) 或 任一骗局标记为 true 或 扣非/NI<0.7(盈利质量差) 或 政治风险评级高且已兑现
 - **特别警惕:** growth_to_cyclical_risk = true 的赛道,成长逻辑可能已转周期,不能按成长股估值
 - **业绩验证:** 周期(有成长潜力)需看 Q2/Q3 营收 + 扣非持续增长,否则按纯周期处理
 - **政治风险核查:** 命中任一风险敞口类型时,必须查最新新闻 + 企业公告判断是否已兑现;反向受益(如国产替代叙事)需明确公司是受益方还是受损方
+- **一致预期陷阱:** 机构共识强 + 目标价空间大 ≠ 必涨。当一致预期过强 + 高位 + 量价顶背离时,反而要警惕(机构抱团股一旦瓦解跌幅深)。机构研报是参考,不是真理 - 外资明显更悲观时尤其要重视
 
 ## 数据不足时
 

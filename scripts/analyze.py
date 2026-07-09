@@ -13,6 +13,7 @@ import numpy as np
 from fetch_data import fetch, fetch_fundamental, check_akshare_version
 from compute_indicators import compute
 from fundamental import analyze_fundamental
+from fetch_research_reports import fetch_research_reports
 
 
 def _json_default(o):
@@ -34,10 +35,20 @@ def analyze(code_or_name: str, days: int = 120, include_fundamental: bool = True
 
     fundamental = None
     free_float_shares = None
+    research_reports = None
     if include_fundamental:
         try:
             fund_data = fetch_fundamental(raw["code"])
             free_float_shares = fund_data.get("free_float_shares")
+            # 当前价(用于目标价上涨空间计算):从 indicators 取
+            current_price = indicators.get("position", {}).get("current_close")
+            # 拉取机构研报(失败不阻塞主流程)
+            try:
+                research_reports = fetch_research_reports(
+                    raw["code"], lookback_days=365, current_price=current_price
+                )
+            except Exception as e:
+                research_reports = {"error": str(e), "total_reports": 0, "reports": []}
             fundamental = analyze_fundamental(
                 code=fund_data["code"],
                 name=raw["name"],
@@ -45,6 +56,7 @@ def analyze(code_or_name: str, days: int = 120, include_fundamental: bool = True
                 pe=fund_data["pe"],
                 pb=fund_data["pb"],
                 financials=fund_data["financials"],
+                research_reports=research_reports,
             )
         except Exception as e:
             fundamental = {"error": str(e)}
