@@ -1806,18 +1806,21 @@ def test_short_term_trend_in_compute():
 
 
 def test_short_term_chip_in_recompute():
-    """端到端:recompute_chip_with_float 后含 short_term_chip 字段。"""
+    """端到端:compute() 默认用固定 decay 算 short_term_chip;recompute_chip_with_float 用流通股本重算(换手率衰减)。"""
     from compute_indicators import compute, recompute_chip_with_float
     closes = [10 + i * 0.05 for i in range(120)]
     vols = [1000 + i * 5 for i in range(120)]
     daily = make_daily(closes, vols)
     indicators = compute(daily)
-    assert "short_term_chip" not in indicators  # 没 free_float_shares 时不算
-    indicators = recompute_chip_with_float(indicators, daily, free_float_shares=500000)
+    # compute() 默认用固定 decay 算 short_term_chip
     assert "short_term_chip" in indicators
-    stc = indicators["short_term_chip"]
-    assert stc["available"] is True
-    print(f"✅ test_short_term_chip_in_recompute passed (trend={stc.get('trend', {}).get('peak_migration')})")
+    assert indicators["short_term_chip"]["available"] is True
+    assert indicators["short_term_chip"]["windows"][5]["decay_mode"] == "fixed"
+    # recompute_chip_with_float 用流通股本重算(换手率衰减)
+    indicators = recompute_chip_with_float(indicators, daily, free_float_shares=500000)
+    assert indicators["short_term_chip"]["available"] is True
+    assert indicators["short_term_chip"]["windows"][5]["decay_mode"] == "turnover"
+    print(f"✅ test_short_term_chip_in_recompute passed (trend={indicators['short_term_chip'].get('trend', {}).get('peak_migration')}, decay={indicators['short_term_chip']['windows'][5]['decay_mode']})")
 
 
 if __name__ == "__main__":

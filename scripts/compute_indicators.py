@@ -465,6 +465,13 @@ def compute(daily: List[Dict[str, Any]]) -> Dict[str, Any]:
     breakout = breakout_3day(df)
     traps = detect_traps(df, quad)
     chip = chip_analyze(daily)
+    # 短期筹码对比:默认用固定 decay 计算,有流通股本时由 recompute_chip_with_float 重算
+    short_term_chip = None
+    try:
+        from chip_distribution import compute_short_term_chip_trend
+        short_term_chip = compute_short_term_chip_trend(daily, free_float_shares=None)
+    except Exception:
+        pass
 
     five_step = {
         "1_position": {
@@ -519,6 +526,7 @@ def compute(daily: List[Dict[str, Any]]) -> Dict[str, Any]:
         "breakout": breakout,
         "five_step": five_step,
         "chip": chip,
+        "short_term_chip": short_term_chip or {"available": False, "reason": "compute failed"},
     }
 
 
