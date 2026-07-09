@@ -720,3 +720,179 @@ def compute_short_term_chip_trend(
         },
         "interpretation": "; ".join(interpretations) if interpretations else "无明显趋势",
     }
+
+
+# ---------- 筹码 × 主力资金流 交叉验证 ----------
+
+def cross_validate_chip_capital(
+    chip: Dict[str, Any],
+    short_term_chip: Dict[str, Any],
+    capital_flow: Dict[str, Any],
+) -> Dict[str, Any]:
+    """筹码 × 主力资金流交叉验证,确认主力意图。
+
+    矩阵(短期筹码趋势 × 主力资金):
+    | 短期筹码      | 主力净流入        | 主力净流出        |
+    |--------------|-------------------|-------------------|
+    | 主峰上移     | ✅ 强吸筹(资金+筹码双确认) | ⚠️ 派发(高位换手出货) |
+    | 主峰稳定     | 低位吸筹(悄然收集) | 暗中派发(主力撤离) |
+    | 主峰下移     | 抄底进场(恐慌盘接货) | 弱势阴跌(无承接) |
+    | 集中度上升   | ✅ 强吸筹(筹码集中) | 派发尾声(散户接盘) |
+    | 集中度下降   | 派发(筹码分散) | 强派发(主力+散户双撤) |
+
+    Args:
+        chip: compute_chip_distribution 的输出(indicators.chip)
+        short_term_chip: compute_short_term_chip_trend 的输出(indicators.short_term_chip)
+        capital_flow: fetch_capital_flow 的输出(indicators.capital_flow)
+
+    Returns:
+        {
+            "available": bool,
+            "main_force_intent": "强吸筹" | "吸筹" | "派发" | "强派发" | "中性" | "矛盾",
+            "confidence": "高" | "中" | "低",
+            "evidence": [str, ...],
+            "interpretation": str,
+            "action_hint": str,
+        }
+    """
+    # 任一输入 unavailable -> 整体不可用
+    if not capital_flow or not capital_flow.get("available"):
+        return {"available": False, "reason": "资金流数据不可用"}
+    if not short_term_chip or not short_term_chip.get("available"):
+        return {"available": False, "reason": "短期筹码数据不可用"}
+
+    # 提取筹码信号
+    st_trend = short_term_chip.get("trend", {})
+    peak_migration = st_trend.get("peak_migration", "稳定")  # 向上迁移/向下迁移/稳定
+    conc_trend = st_trend.get("concentration_trend", "稳定")  # 上升/下降/稳定
+    cyqk_trend = st_trend.get("cyqk_trend", "稳定")
+
+    # 提取资金流信号
+    cf_signals = capital_flow.get("signals", {})
+    cf_action = cf_signals.get("main_force_action", "中性")  # 吸筹/派发/中性
+    cf_strength = cf_signals.get("strength", "弱")  # 强/中/弱
+    cf_trend = capital_flow.get("trend", {})
+    cf_consecutive = cf_trend.get("consecutive_days", 0)
+
+    # 今日主力净额
+    today = capital_flow.get("today", {})
+    today_main_net = today.get("main_net_amount") or 0
+    today_main_pct = today.get("main_net_pct") or 0
+
+    # 5日累计
+    cum_5d = capital_flow.get("cumulative", {}).get("5d", {})
+    cum_5d_net = cum_5d.get("main_net_amount") or 0
+
+    evidence: List[str] = []
+    evidence.append(f"短期主峰{peak_migration}")
+    evidence.append(f"集中度{conc_trend}")
+    evidence.append(f"主力资金{cf_action}({cf_strength})")
+    evidence.append(f"今日主力净额 {today_main_net:,.0f}({today_main_pct}%)")
+    evidence.append(f"连续 {abs(cf_consecutive)} 日{'流入' if cf_consecutive > 0 else '流出' if cf_consecutive < 0 else '无持续'}")
+
+    # ---- 交叉验证逻辑 ----
+    # 资金方向:inflow(净流入)/ outflow(净流出)/ neutral
+    capital_inflow = cf_action == "吸筹" or (cf_consecutive > 0 and today_main_net > 0)
+    capital_outflow = cf_action == "派发" or (cf_consecutive < 0 and today_main_net < 0)
+
+    # 筹码方向
+    peak_up = peak_migration == "向上迁移"
+    peak_down = peak_migration == "向下迁移"
+    conc_up = conc_trend == "上升"
+    conc_down = conc_trend == "下降"
+
+    intent = "中性"
+    confidence = "中"
+    interpretation = ""
+    action_hint = ""
+
+    # 强吸筹:筹码集中 + 资金流入(双确认)
+    if capital_inflow and (conc_up or (peak_up and conc_up)):
+        intent = "强吸筹"
+        confidence = "高"
+        interpretation = "筹码集中 + 主力资金流入,双确认吸筹,主力在收集筹码"
+        action_hint = "可逢低跟随,止损设在主力成本区下方"
+    # 强吸筹:主峰上移 + 资金流入(高位承接)
+    elif capital_inflow and peak_up and not conc_down:
+        intent = "强吸筹"
+        confidence = "高"
+        interpretation = "主峰上移 + 资金流入,高位承接增强且资金进场,主力向上拉升"
+        action_hint = "可持有/轻仓跟进,注意上方压力位"
+    # 派发:主峰上移 + 资金流出(高位换手出货)
+    elif capital_outflow and peak_up:
+        intent = "派发"
+        confidence = "高"
+        interpretation = "主峰上移 + 主力资金流出,高位换手出货,散户接盘主力撤离"
+        action_hint = "警惕减仓,不追高,跌破主峰支撑离场"
+    # 强派发:集中度下降 + 资金流出(主力+散户双撤)
+    elif capital_outflow and conc_down:
+        intent = "强派发"
+        confidence = "高"
+        interpretation = "筹码分散 + 主力资金流出,主力散户双撤,趋势走弱"
+        action_hint = "立即减仓,反弹不参与,等筹码重新集中"
+    # 派发:集中度上升 + 资金流出(派发尾声,散户接盘)
+    elif capital_outflow and conc_up:
+        intent = "派发"
+        confidence = "中"
+        interpretation = "筹码集中但主力流出,可能是派发尾声散户接盘,或换庄"
+        action_hint = "观望,等资金信号转正再介入"
+    # 低位吸筹:主峰稳定 + 资金流入
+    elif capital_inflow and (not peak_up and not peak_down):
+        intent = "吸筹"
+        confidence = "中"
+        interpretation = "主峰稳定 + 资金流入,主力在低位悄然收集筹码"
+        action_hint = "可分批低吸,等放量突破再加仓"
+    # 暗中派发:主峰稳定 + 资金流出
+    elif capital_outflow and (not peak_up and not peak_down):
+        intent = "派发"
+        confidence = "中"
+        interpretation = "主峰稳定但资金流出,主力在震荡中悄然撤离"
+        action_hint = "减仓防范,破位果断止损"
+    # 抄底进场:主峰下移 + 资金流入(恐慌盘接货)
+    elif capital_inflow and peak_down:
+        intent = "吸筹"
+        confidence = "中"
+        interpretation = "主峰下移 + 资金流入,主力在恐慌中接货抄底"
+        action_hint = "等企稳信号再进场,不抢反弹"
+    # 弱势阴跌:主峰下移 + 资金流出
+    elif capital_outflow and peak_down:
+        intent = "强派发"
+        confidence = "高"
+        interpretation = "主峰下移 + 资金流出,无承接阴跌,远离"
+        action_hint = "不参与,等资金流入 + 主峰企稳"
+    # 矛盾场景
+    elif (peak_up and conc_down) or (peak_down and conc_up):
+        intent = "矛盾"
+        confidence = "低"
+        interpretation = "筹码信号矛盾(主峰与集中度方向不一致),需更多数据确认"
+        action_hint = "观望,等信号一致再操作"
+    # 中性
+    else:
+        intent = "中性"
+        confidence = "低"
+        interpretation = "筹码与资金信号均不明确,无方向"
+        action_hint = "观望为主"
+
+    # 资金强度调整置信度
+    if cf_strength == "强" and confidence == "中":
+        confidence = "高"
+    if cf_strength == "弱" and confidence == "高" and intent not in ("强吸筹", "强派发"):
+        confidence = "中"
+
+    return {
+        "available": True,
+        "main_force_intent": intent,
+        "confidence": confidence,
+        "evidence": evidence,
+        "interpretation": interpretation,
+        "action_hint": action_hint,
+        "inputs": {
+            "peak_migration": peak_migration,
+            "concentration_trend": conc_trend,
+            "cyqk_trend": cyqk_trend,
+            "capital_action": cf_action,
+            "capital_strength": cf_strength,
+            "today_main_net": round(today_main_net, 0),
+            "consecutive_days": cf_consecutive,
+        },
+    }

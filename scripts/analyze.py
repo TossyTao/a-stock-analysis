@@ -14,6 +14,7 @@ from fetch_data import fetch, fetch_fundamental, check_akshare_version
 from compute_indicators import compute
 from fundamental import analyze_fundamental
 from fetch_research_reports import fetch_research_reports
+from fetch_capital_flow import fetch_capital_flow
 
 
 def _json_default(o):
@@ -68,6 +69,24 @@ def analyze(code_or_name: str, days: int = 120, include_fundamental: bool = True
             indicators = recompute_chip_with_float(indicators, raw["daily"], free_float_shares)
         except Exception:
             pass
+
+    # 拉取主力资金流(失败不阻塞主流程)
+    try:
+        capital_flow = fetch_capital_flow(raw["code"], days=60)
+    except Exception as e:
+        capital_flow = {"available": False, "error": str(e)}
+    indicators["capital_flow"] = capital_flow
+
+    # 筹码 × 主力资金流交叉验证(在 recompute_chip_with_float 之后,确保 short_term_chip 已重算)
+    try:
+        from chip_distribution import cross_validate_chip_capital
+        indicators["chip_cross_validation"] = cross_validate_chip_capital(
+            chip=indicators.get("chip", {}),
+            short_term_chip=indicators.get("short_term_chip", {}),
+            capital_flow=capital_flow,
+        )
+    except Exception:
+        pass
 
     return {
         "basic": {

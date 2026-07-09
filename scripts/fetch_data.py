@@ -129,6 +129,8 @@ _CACHE_TTL = {
     "daily": timedelta(hours=4),       # 日线数据:4 小时(覆盖盘中+盘后)
     "fundamental": timedelta(days=1),  # 财务摘要:1 天
     "name": timedelta(days=7),         # 股票名称表:7 天
+    "research_report": timedelta(days=1),  # 研报:1 天
+    "capital_flow": timedelta(hours=4),    # 主力资金流:4 小时(盘中+盘后)
 }
 
 

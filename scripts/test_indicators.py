@@ -1823,6 +1823,303 @@ def test_short_term_chip_in_recompute():
     print(f"✅ test_short_term_chip_in_recompute passed (trend={indicators['short_term_chip'].get('trend', {}).get('peak_migration')}, decay={indicators['short_term_chip']['windows'][5]['decay_mode']})")
 
 
+# ==================== 主力资金流 + 筹码交叉验证 测试 ====================
+
+def _make_flow_df(days: int = 30, base_main_net: float = 0.0,
+                  trend_per_day: float = 0.0, base_close: float = 42.0) -> list:
+    """合成 N 天资金流 DataFrame(用于测试,不走网络)。"""
+    import pandas as pd
+    rows = []
+    for i in range(days):
+        # 主力净额 = 基础 + 趋势*i + 小波动
+        main_net = base_main_net + trend_per_day * i
+        rows.append({
+            "date": pd.Timestamp("2026-01-01") + pd.Timedelta(days=i),
+            "main_net": main_net,
+            "main_pct": main_net / 1e6,  # 简化:1百万 = 1%
+            "super_large_net": main_net * 0.6,
+            "large_net": main_net * 0.4,
+            "mid_net": -main_net * 0.5,
+            "small_net": -main_net * 0.5,
+            "super_large_pct": main_net / 1e6 * 0.6,
+            "large_pct": main_net / 1e6 * 0.4,
+            "mid_pct": -main_net / 1e6 * 0.5,
+            "small_pct": -main_net / 1e6 * 0.5,
+            "close": base_close + i * 0.1,
+            "pct_chg": 0.1,
+        })
+    return pd.DataFrame(rows)
+
+
+def test_capital_flow_detect_secid():
+    """secid 检测:SH=1.XXX, SZ/BJ=0.XXX。"""
+    from fetch_capital_flow import _detect_secid
+    assert _detect_secid("002472") == "0.002472"  # SZ
+    assert _detect_secid("600519") == "1.600519"  # SH
+    assert _detect_secid("300750") == "0.300750"  # SZ 创业板
+    assert _detect_secid("830879") == "0.830879"  # BJ
+    print("✅ test_capital_flow_detect_secid passed")
+
+
+def test_capital_flow_parse_klines():
+    """klines 字符串解析:date,main_net,small_net,...,close,pct_chg。"""
+    from fetch_capital_flow import _parse_klines
+    klines = [
+        "2026-01-07,-80205389.0,130697523.0,-50492112.0,-46555824.0,-33649565.0,-7.05,11.48,-4.44,-4.09,-2.96,45.51,-1.13,0.00,0.00",
+        "2026-01-08,-42617582.0,25539294.0,17078288.0,-15575600.0,-27041982.0,-3.99,2.39,1.60,-1.46,-2.53,45.48,-0.07,0.00,0.00",
+    ]
+    df = _parse_klines(klines)
+    assert len(df) == 2
+    assert df.iloc[0]["main_net"] == -80205389.0
+    assert df.iloc[0]["small_net"] == 130697523.0
+    assert df.iloc[0]["close"] == 45.51
+    assert df.iloc[1]["main_pct"] == -3.99
+    # 按日期升序
+    assert df.iloc[0]["date"] < df.iloc[1]["date"]
+    print(f"✅ test_capital_flow_parse_klines passed (rows={len(df)}, first_main_net={df.iloc[0]['main_net']})")
+
+
+def test_capital_flow_cumulative():
+    """5/10/20 日累计计算 + 流入/流出天数。"""
+    from fetch_capital_flow import _compute_cumulative
+    df = _make_flow_df(days=25, base_main_net=1e7)  # 全部流入
+    cum = _compute_cumulative(df)
+    assert cum["5d"]["available"] is True
+    assert cum["5d"]["days_inflow"] == 5
+    assert cum["5d"]["days_outflow"] == 0
+    assert cum["5d"]["main_net_amount"] > 0
+    assert cum["10d"]["days_inflow"] == 10
+    assert cum["20d"]["days_inflow"] == 20
+    print(f"✅ test_capital_flow_cumulative passed (5d_net={cum['5d']['main_net_amount']:.0f}, 5d_inflow_days={cum['5d']['days_inflow']})")
+
+
+def test_capital_flow_consecutive_inflow():
+    """连续流入天数:最近5日全流入 -> consecutive=5, label=持续流入。"""
+    from fetch_capital_flow import _compute_trend
+    df = _make_flow_df(days=25, base_main_net=1e7)  # 全部流入
+    trend = _compute_trend(df)
+    assert trend["available"] is True
+    assert trend["consecutive_days"] == 25  # 全部25天都流入
+    assert "流入" in trend["consecutive_label"]
+    print(f"✅ test_capital_flow_consecutive_inflow passed (consecutive={trend['consecutive_days']}, label={trend['consecutive_label']})")
+
+
+def test_capital_flow_consecutive_outflow():
+    """连续流出天数:最近5日全流出 -> consecutive=-5, label=持续流出。"""
+    from fetch_capital_flow import _compute_trend
+    df = _make_flow_df(days=25, base_main_net=-1e7)  # 全部流出
+    trend = _compute_trend(df)
+    assert trend["consecutive_days"] == -25
+    assert "流出" in trend["consecutive_label"]
+    print(f"✅ test_capital_flow_consecutive_outflow passed (consecutive={trend['consecutive_days']}, label={trend['consecutive_label']})")
+
+
+def test_capital_flow_ma_cross_golden():
+    """MA5 上穿 MA20:前20天流出,今日大量流入 -> 金叉(交叉正好在今日)。"""
+    from fetch_capital_flow import _compute_trend
+    import pandas as pd
+    rows = []
+    # 前20天:小幅流出
+    for i in range(20):
+        rows.append({"date": pd.Timestamp("2026-01-01") + pd.Timedelta(days=i),
+                     "main_net": -1e6, "main_pct": -0.1, "super_large_net": 0,
+                     "large_net": 0, "mid_net": 0, "small_net": 0,
+                     "super_large_pct": 0, "large_pct": 0, "mid_pct": 0, "small_pct": 0,
+                     "close": 42.0, "pct_chg": 0.0})
+    # 第21天(今日):大幅流入,让 MA5 在今日上穿 MA20
+    rows.append({"date": pd.Timestamp("2026-01-21"),
+                 "main_net": 5e7, "main_pct": 5.0, "super_large_net": 0,
+                 "large_net": 0, "mid_net": 0, "small_net": 0,
+                 "super_large_pct": 0, "large_pct": 0, "mid_pct": 0, "small_pct": 0,
+                 "close": 42.0, "pct_chg": 0.0})
+    df = pd.DataFrame(rows)
+    trend = _compute_trend(df)
+    # 昨日 MA5=-1e6, MA20=-1e6(相等,prev_ma5 <= prev_ma20 成立)
+    # 今日 MA5=(4*(-1e6)+5e7)/5=9.2e6, MA20=(19*(-1e6)+5e7)/20=1.55e6 -> MA5>MA20 -> 金叉
+    assert trend["ma_cross"] == "金叉", f"expected 金叉, got {trend['ma_cross']} (MA5={trend['main_net_ma5']:.0f}, MA20={trend['main_net_ma20']:.0f})"
+    print(f"✅ test_capital_flow_ma_cross_golden passed (ma_cross={trend['ma_cross']}, MA5={trend['main_net_ma5']:.0f}, MA20={trend['main_net_ma20']:.0f})")
+
+
+def test_capital_flow_ma_cross_death():
+    """MA5 下穿 MA20:前20天流入,今日大量流出 -> 死叉。"""
+    from fetch_capital_flow import _compute_trend
+    import pandas as pd
+    rows = []
+    for i in range(20):
+        rows.append({"date": pd.Timestamp("2026-01-01") + pd.Timedelta(days=i),
+                     "main_net": 1e6, "main_pct": 0.1, "super_large_net": 0,
+                     "large_net": 0, "mid_net": 0, "small_net": 0,
+                     "super_large_pct": 0, "large_pct": 0, "mid_pct": 0, "small_pct": 0,
+                     "close": 42.0, "pct_chg": 0.0})
+    rows.append({"date": pd.Timestamp("2026-01-21"),
+                 "main_net": -5e7, "main_pct": -5.0, "super_large_net": 0,
+                 "large_net": 0, "mid_net": 0, "small_net": 0,
+                 "super_large_pct": 0, "large_pct": 0, "mid_pct": 0, "small_pct": 0,
+                 "close": 42.0, "pct_chg": 0.0})
+    df = pd.DataFrame(rows)
+    trend = _compute_trend(df)
+    assert trend["ma_cross"] == "死叉", f"expected 死叉, got {trend['ma_cross']} (MA5={trend['main_net_ma5']:.0f}, MA20={trend['main_net_ma20']:.0f})"
+    print(f"✅ test_capital_flow_ma_cross_death passed (ma_cross={trend['ma_cross']}, MA5={trend['main_net_ma5']:.0f}, MA20={trend['main_net_ma20']:.0f})")
+
+
+def test_capital_flow_signal_accumulation():
+    """吸筹信号:连续≥3日净流入 + 5日均主力净占比≥5%。"""
+    from fetch_capital_flow import _compute_signals, _compute_trend, _compute_cumulative
+    # 5天,每天主力净流入 6百万,占比 6%
+    df = _make_flow_df(days=20, base_main_net=6e6)
+    trend = _compute_trend(df)
+    cum = _compute_cumulative(df)
+    sig = _compute_signals(df, trend, cum)
+    assert sig["main_force_action"] == "吸筹"
+    print(f"✅ test_capital_flow_signal_accumulation passed (action={sig['main_force_action']}, strength={sig['strength']})")
+
+
+def test_capital_flow_signal_distribution():
+    """派发信号:连续≥3日净流出 + 5日均主力净占比≤-5%。"""
+    from fetch_capital_flow import _compute_signals, _compute_trend, _compute_cumulative
+    df = _make_flow_df(days=20, base_main_net=-6e6)
+    trend = _compute_trend(df)
+    cum = _compute_cumulative(df)
+    sig = _compute_signals(df, trend, cum)
+    assert sig["main_force_action"] == "派发"
+    print(f"✅ test_capital_flow_signal_distribution passed (action={sig['main_force_action']}, strength={sig['strength']})")
+
+
+def test_capital_flow_signal_strong_accumulation():
+    """强吸筹:连续≥5日 + 5日均占比≥10%。"""
+    from fetch_capital_flow import _compute_signals, _compute_trend, _compute_cumulative
+    # 5天,每天主力净流入 1.2千万,占比 12%
+    df = _make_flow_df(days=20, base_main_net=1.2e7)
+    trend = _compute_trend(df)
+    cum = _compute_cumulative(df)
+    sig = _compute_signals(df, trend, cum)
+    assert sig["main_force_action"] == "吸筹"
+    assert sig["strength"] == "强"
+    print(f"✅ test_capital_flow_signal_strong_accumulation passed (action={sig['main_force_action']}, strength={sig['strength']})")
+
+
+def test_capital_flow_signal_neutral():
+    """中性:净流入流出交替,信号不足。"""
+    from fetch_capital_flow import _compute_signals, _compute_trend, _compute_cumulative
+    import pandas as pd
+    rows = []
+    for i in range(20):
+        # 交替正负
+        main_net = 1e6 if i % 2 == 0 else -1e6
+        rows.append({"date": pd.Timestamp("2026-01-01") + pd.Timedelta(days=i),
+                     "main_net": main_net, "main_pct": main_net / 1e6,
+                     "super_large_net": 0, "large_net": 0, "mid_net": 0, "small_net": 0,
+                     "super_large_pct": 0, "large_pct": 0, "mid_pct": 0, "small_pct": 0,
+                     "close": 42.0, "pct_chg": 0.0})
+    df = pd.DataFrame(rows)
+    trend = _compute_trend(df)
+    cum = _compute_cumulative(df)
+    sig = _compute_signals(df, trend, cum)
+    assert sig["main_force_action"] == "中性"
+    print(f"✅ test_capital_flow_signal_neutral passed (action={sig['main_force_action']})")
+
+
+def test_cross_validate_strong_accumulation():
+    """强吸筹:主峰上移 + 资金流入 -> 强吸筹(高置信度)。"""
+    from chip_distribution import cross_validate_chip_capital
+    chip = {"available": True}
+    short_term_chip = {
+        "available": True,
+        "trend": {
+            "peak_migration": "向上迁移",
+            "concentration_trend": "上升",
+            "cyqk_trend": "上升",
+        },
+    }
+    capital_flow = {
+        "available": True,
+        "today": {"main_net_amount": 5e7, "main_net_pct": 8.0},
+        "cumulative": {"5d": {"main_net_amount": 2e8}},
+        "trend": {"consecutive_days": 5, "ma_cross": "金叉"},
+        "signals": {"main_force_action": "吸筹", "strength": "强"},
+    }
+    result = cross_validate_chip_capital(chip, short_term_chip, capital_flow)
+    assert result["available"] is True
+    assert result["main_force_intent"] == "强吸筹"
+    assert result["confidence"] == "高"
+    print(f"✅ test_cross_validate_strong_accumulation passed (intent={result['main_force_intent']}, confidence={result['confidence']})")
+
+
+def test_cross_validate_distribution():
+    """派发:主峰上移 + 资金流出 -> 派发(高位换手出货)。"""
+    from chip_distribution import cross_validate_chip_capital
+    chip = {"available": True}
+    short_term_chip = {
+        "available": True,
+        "trend": {
+            "peak_migration": "向上迁移",
+            "concentration_trend": "下降",  # 集中度下降
+            "cyqk_trend": "下降",
+        },
+    }
+    capital_flow = {
+        "available": True,
+        "today": {"main_net_amount": -5e7, "main_net_pct": -8.0},
+        "cumulative": {"5d": {"main_net_amount": -2e8}},
+        "trend": {"consecutive_days": -5, "ma_cross": "死叉"},
+        "signals": {"main_force_action": "派发", "strength": "强"},
+    }
+    result = cross_validate_chip_capital(chip, short_term_chip, capital_flow)
+    assert result["available"] is True
+    # 主峰上移 + 资金流出 -> 派发(高置信度)
+    assert result["main_force_intent"] in ("派发", "强派发")
+    assert result["confidence"] == "高"
+    print(f"✅ test_cross_validate_distribution passed (intent={result['main_force_intent']}, confidence={result['confidence']})")
+
+
+def test_cross_validate_contradiction():
+    """矛盾:主峰上移 + 集中度下降(筹码信号内部矛盾)。"""
+    from chip_distribution import cross_validate_chip_capital
+    chip = {"available": True}
+    short_term_chip = {
+        "available": True,
+        "trend": {
+            "peak_migration": "向上迁移",
+            "concentration_trend": "下降",  # 与主峰上移矛盾
+            "cyqk_trend": "稳定",
+        },
+    }
+    capital_flow = {
+        "available": True,
+        "today": {"main_net_amount": 1e6, "main_net_pct": 0.5},
+        "cumulative": {"5d": {"main_net_amount": 5e6}},
+        "trend": {"consecutive_days": 1, "ma_cross": "无交叉"},
+        "signals": {"main_force_action": "中性", "strength": "弱"},
+    }
+    result = cross_validate_chip_capital(chip, short_term_chip, capital_flow)
+    assert result["available"] is True
+    # 主峰上移 + 集中度下降 = 矛盾
+    assert result["main_force_intent"] == "矛盾"
+    assert result["confidence"] == "低"
+    print(f"✅ test_cross_validate_contradiction passed (intent={result['main_force_intent']}, confidence={result['confidence']})")
+
+
+def test_cross_validate_unavailable():
+    """任一输入缺失 -> available=False。"""
+    from chip_distribution import cross_validate_chip_capital
+    # 资金流不可用
+    result = cross_validate_chip_capital(
+        {"available": True},
+        {"available": True, "trend": {}},
+        {"available": False, "error": "rate limited"},
+    )
+    assert result["available"] is False
+
+    # 短期筹码不可用
+    result = cross_validate_chip_capital(
+        {"available": True},
+        {"available": False, "reason": "数据不足"},
+        {"available": True, "today": {}, "trend": {}, "signals": {}},
+    )
+    assert result["available"] is False
+    print("✅ test_cross_validate_unavailable passed")
+
+
 if __name__ == "__main__":
     test_position_percentile()
     test_position_label()
@@ -1950,4 +2247,20 @@ if __name__ == "__main__":
     test_short_term_trend_acceleration()
     test_short_term_trend_in_compute()
     test_short_term_chip_in_recompute()
+    # 主力资金流 + 筹码交叉验证
+    test_capital_flow_detect_secid()
+    test_capital_flow_parse_klines()
+    test_capital_flow_cumulative()
+    test_capital_flow_consecutive_inflow()
+    test_capital_flow_consecutive_outflow()
+    test_capital_flow_ma_cross_golden()
+    test_capital_flow_ma_cross_death()
+    test_capital_flow_signal_accumulation()
+    test_capital_flow_signal_distribution()
+    test_capital_flow_signal_strong_accumulation()
+    test_capital_flow_signal_neutral()
+    test_cross_validate_strong_accumulation()
+    test_cross_validate_distribution()
+    test_cross_validate_contradiction()
+    test_cross_validate_unavailable()
     print("\n🎉 All tests passed!")
