@@ -1,5 +1,5 @@
 """量价指标计算:位置分位、均量线、量比、地量、单日象限、5日趋势、背离、突破站稳、筹码峰。"""
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import numpy as np
 import pandas as pd
 
@@ -369,3 +369,22 @@ def compute(daily: List[Dict[str, Any]]) -> Dict[str, Any]:
         "five_step": five_step,
         "chip": chip,
     }
+
+
+def recompute_chip_with_float(
+    indicators: Dict[str, Any],
+    daily: List[Dict[str, Any]],
+    free_float_shares: float,
+) -> Dict[str, Any]:
+    """拿到流通股本后,用换手率衰减模型重算筹码(替换原固定 decay 的版本)。
+
+    同时把 breakout.resistance 传给筹码模块用于升级信号判断。
+    """
+    breakout = indicators.get("breakout", {})
+    resistance = breakout.get("resistance")
+    try:
+        new_chip = chip_analyze(daily, free_float_shares=free_float_shares, breakout_resistance=resistance)
+        indicators["chip"] = new_chip
+    except Exception:
+        pass
+    return indicators

@@ -33,9 +33,11 @@ def analyze(code_or_name: str, days: int = 120, include_fundamental: bool = True
     indicators = compute(raw["daily"])
 
     fundamental = None
+    free_float_shares = None
     if include_fundamental:
         try:
             fund_data = fetch_fundamental(raw["code"])
+            free_float_shares = fund_data.get("free_float_shares")
             fundamental = analyze_fundamental(
                 code=fund_data["code"],
                 name=raw["name"],
@@ -47,12 +49,21 @@ def analyze(code_or_name: str, days: int = 120, include_fundamental: bool = True
         except Exception as e:
             fundamental = {"error": str(e)}
 
+    # 用流通股本重算筹码(换手率衰减模型);失败降级到固定 decay
+    if free_float_shares is not None:
+        try:
+            from compute_indicators import recompute_chip_with_float
+            indicators = recompute_chip_with_float(indicators, raw["daily"], free_float_shares)
+        except Exception:
+            pass
+
     return {
         "basic": {
             "code": raw["code"],
             "name": raw["name"],
             "days_returned": raw["days_returned"],
             "data_insufficient": raw["data_insufficient"],
+            "free_float_shares": free_float_shares,
         },
         "indicators": indicators,
         "fundamental": fundamental,

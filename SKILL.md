@@ -90,15 +90,43 @@ python3 analyze.py 000001 --no-fundamental  # 跳过基本面(网络差时)
 
 **一致性:** `trend_5d.consistency`(如 4/4),近 4 日单日象限与 5 日趋势象限一致的天数。一致性 ≥ 3/4 趋势可靠;< 2/4 可能是震荡而非趋势。
 
-## 矩阵 2:筹码峰形态
+## 矩阵 2:筹码峰形态(换手率衰减 + 底仓追踪)
 
-从 `indicators.chip.pattern` 读取,三种典型形态:
+### 2.1 物理基础:筹码守恒
 
-| 形态 | 位置语境 | 含义 | 操作 |
-|------|----------|------|------|
-| 低位单峰 | 主峰在区间下沿,贴近当前价 | 主力吸筹,长期下跌横盘后等放量易拉升 | 关注放量信号,准备低吸 |
-| 高位单峰 | 主峰在区间上沿,贴近当前价 | 出货风险,散户盼回本抛压大 | 警惕减仓,不追高 |
-| 双峰 | 两个显著峰,当前价在两峰之间 | 适合波段做T,股价在两峰之间震荡 | 区间内高抛低吸 |
+从 `indicators.chip.decay_meta` 读取衰减模式:
+- **turnover 模式**(有流通股本):每日筹码保留率 = (1 - turnover_t),turnover_t = vol_t / 流通股本。**真实换手数据藏不住主力操作**。
+- **fixed 模式**(无流通股本兜底):固定 decay=0.05(半衰期 ~13 天)。
+
+主力再怎么对倒、藏仓,真实换手率会暴露筹码转移。底仓追踪就是基于此:
+
+### 2.2 三大形态 + 升级信号
+
+从 `indicators.chip.pattern` 读取,三种典型形态 + `enhanced_signal` 升级标记:
+
+| 形态 | 位置语境 | 含义 | 升级信号 | 操作 |
+|------|----------|------|----------|------|
+| 低位单峰 | 主峰在区间下沿,贴近当前价 | 主力吸筹 | **主升浪信号**:今日换手 <1.5%(无量突破) | 关注放量,准备低吸 |
+| 高位单峰 | 主峰在区间上沿,贴近当前价 | 出货风险 | **见顶信号**:底仓消失(保留率 <20%) | 立即减仓 |
+| 双峰 | 两个显著峰,当前价在两峰之间 | 区间震荡 | **洗盘信号**:底仓保留率 ≥50%(不萎缩) | 区间内高抛低吸 |
+
+### 2.3 底仓追踪(反人性信号)
+
+从 `indicators.chip.bottom_retention` 读取:
+- **底仓不动**(价格涨 ≥30% + 底仓保留率 ≥50%):散户早止盈了,底仓不动说明主力还在 - **主升浪续涨信号**,不是出货!
+- **底仓消失**(保留率 <20%):主力出货完成 - 见顶信号
+- **底仓部分转移**(20-50%):信号不明确,结合其他证据
+
+反人性洞察:涨 30-50% 底部筹码不动 = 要翻倍的信号,不是出货。
+
+### 2.4 ASR / CYQK 辅助指标
+
+从 `indicators.chip.asr` / `indicators.chip.cyqk` 读取:
+
+| 指标 | 含义 | 关键判断 |
+|------|------|----------|
+| ASR | ±10% 带内筹码占比(活动筹码) | 下跌中 ASR 高(≥50%) = 筹码锁死,主力控盘 |
+| CYQK_WIN | 当前价下方筹码占比(获利比例) | <40% 套牢多反弹抛压小;>80% 获利多抛压渐增 |
 
 辅助:`chip.support_resistance.support/resistance`(支撑/压力位)、`chip.concentration_5pct`(≥40% 高度集中)。
 
@@ -271,10 +299,15 @@ python3 analyze.py 000001 --no-fundamental  # 跳过基本面(网络差时)
 信号解读:[从矩阵 1 查 5 日趋势 × 位置]
 拐点验证:[单日与 5 日是否一致,不一致则提示拐点]
 
-## 三、筹码峰分析
+## 三、筹码峰分析(换手率衰减 + 底仓追踪)
+衰减模式:{chip.decay_meta.decay_mode}(avg_turnover {avg_turnover}) / 流通股本 {free_float_shares}
 峰态:{chip.pattern.pattern} / 主峰:{dominant_peak.price}({pct}%,{position_label},{relative_to_price})
+**升级信号**:{chip.pattern.enhanced_signal or "无"} / 今日换手 {today_turnover} / 底仓信号 {bottom_retention_signal}
 支撑位:{support.price}({pct}%) / 压力位:{resistance.price}({pct}%)
 集中度:±5% 内 {concentration_5pct}% -> {concentration_label}
+ASR:{asr.value}%({asr.label}) - {asr.interpretation}
+CYQK 获利比例:{cyqk.win_ratio}%({cyqk.label}) - {cyqk.interpretation}
+底仓追踪:底仓价 {bottom_retention.bottom_peak_price} / 保留率 {retention_ratio} / 涨幅 {price_rise_pct} -> {signal}
 解读:{chip.pattern.interpretation}
 
 ## 四、公司质地判断

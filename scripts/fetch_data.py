@@ -427,10 +427,10 @@ def fetch_fundamental(code: str) -> dict:
     财务摘要带 1 天磁盘缓存。
     """
     code = normalize_code(code)
-    info = {"industry": None, "pe": None, "pb": None}
+    info = {"industry": None, "pe": None, "pb": None, "free_float_shares": None}
     financials = []
 
-    # 行业/PE/PB(em 接口,失败则用 push2 直接 API 兜底)
+    # 行业/PE/PB/流通股本(em 接口,失败则用 push2 直接 API 兜底)
     def _fetch_individual():
         return ak.stock_individual_info_em(symbol=code)
 
@@ -445,11 +445,17 @@ def fetch_fundamental(code: str) -> dict:
                 info["pe"] = _safe_float(v)
             elif k == "市净率" or "市净率" in k:
                 info["pb"] = _safe_float(v)
+            elif "流通股本" in k or k == "流通股" or "流通股" in k:
+                # 单位通常为股,需解析 "X.XX亿股" / "X万股" 等中文格式
+                # eastmoney 用 "流通股",可能值为 "X.XX亿股" 或纯数字(股)
+                info["free_float_shares"] = _parse_shares(v)
     except Exception:
         # 兜底:直接调 eastmoney push2 单股实时接口
         pe_pb = _fetch_pe_pb_push2(code)
         info["pe"] = pe_pb.get("pe")
         info["pb"] = pe_pb.get("pb")
+        if pe_pb.get("free_float_shares"):
+            info["free_float_shares"] = pe_pb["free_float_shares"]
 
     # 行业兜底:常见公司硬编码映射
     if not info["industry"]:
@@ -477,21 +483,42 @@ def fetch_fundamental(code: str) -> dict:
         "industry": info["industry"],
         "pe": info["pe"],
         "pb": info["pb"],
+        "free_float_shares": info["free_float_shares"],
         "financials": financials,
     }
 
 
 def _fetch_pe_pb_push2(code: str) -> dict:
-    """eastmoney push2 单股实时接口兜底拉 PE/PB。"""
+    """eastmoney push2 单股实时接口兜底拉 PE/PB/流通股本。
+
+    fields:
+    - f9: PE(动态)
+    - f23: PB
+    - f2: 最新价
+    - f84: 流通股本(股)
+    - f117: 流通市值(元)
+    无 f84 时用 f117/f2 反推流通股本。
+    """
     secid = f"1.{code}" if code.startswith("6") else f"0.{code}"
-    url = f"https://push2.eastmoney.com/api/qt/stock/get?secid={secid}&fields=f9,f23,f116,f117,f162"
+    url = f"https://push2.eastmoney.com/api/qt/stock/get?secid={secid}&fields=f9,f23,f2,f84,f117,f116,f162"
     try:
         r = _session.get(url, timeout=(10, 15))
         r.raise_for_status()
         data = r.json().get("data", {})
+        pe = _safe_float(data.get("f9"))
+        pb = _safe_float(data.get("f23"))
+        price = _safe_float(data.get("f2"))
+        float_shares = _safe_float(data.get("f84"))
+        float_mv = _safe_float(data.get("f117"))
+
+        # f84 缺失时用 流通市值 / 最新价 反推
+        if not float_shares and float_mv and price and price > 0:
+            float_shares = float_mv / price
+
         return {
-            "pe": _safe_float(data.get("f9")),
-            "pb": _safe_float(data.get("f23")),
+            "pe": pe,
+            "pb": pb,
+            "free_float_shares": float_shares,
         }
     except Exception:
         return {}
@@ -590,6 +617,23 @@ def _safe_float(v):
             return None
         f = float(s)
         return f if f == f else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_shares(v) -> float:
+    """解析流通股本,返回股数。支持 "X.XX亿股" / "X万股" / "X股" / 纯数字。"""
+    if v is None or v == "" or v == "--":
+        return None
+    s = str(v).replace(",", "").strip()
+    if s in ("", "nan", "None", "-"):
+        return None
+    try:
+        if "亿" in s:
+            return float(s.replace("亿", "").replace("股", "").strip()) * 1e8
+        if "万" in s:
+            return float(s.replace("万", "").replace("股", "").strip()) * 1e4
+        return float(s.replace("股", "").strip())
     except (TypeError, ValueError):
         return None
 

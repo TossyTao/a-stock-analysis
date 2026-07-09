@@ -473,7 +473,7 @@ def test_fundamental_end_to_end():
         {"net_profit": 18, "roic": 0.18, "fcf": 16, "revenue": 180},
     ]
     r = analyze_fundamental(
-        code="600000",
+        code="600276",
         name="测试医药",
         industry="医药生物",
         pe=35.0,
@@ -812,6 +812,231 @@ def test_siyuan_industry_fallback():
     print(f"✅ test_siyuan_industry_fallback passed (industry: {ind})")
 
 
+def test_is_bank_detection():
+    """银行识别:行业含'银行'/code 在 BANK_CODES/名称含'银行'。"""
+    from fundamental import is_bank
+    assert is_bank("银行", "600036") is True
+    assert is_bank("", "600036") is True  # code 匹配
+    assert is_bank("股份制银行", "600036") is True
+    assert is_bank("半导体", "603986") is False
+    assert is_bank("", "", name="招商银行") is True
+    assert is_bank("", "", name="兆易创新") is False
+    print("✅ test_is_bank_detection passed")
+
+
+def test_bank_quality_growth_bank():
+    """优质银行(招行类):ROE > 12% 且稳定 -> 成长(优质银行)。"""
+    from fundamental import analyze_fundamental
+    financials = [
+        {"period": "20221231", "net_profit": 100, "revenue": 1000, "roe": 16.5},
+        {"period": "20231231", "net_profit": 110, "revenue": 1100, "roe": 16.2},
+        {"period": "20241231", "net_profit": 120, "revenue": 1200, "roe": 15.8},
+    ]
+    r = analyze_fundamental("600036", "招商银行", "银行", pe=8, pb=1.0, financials=financials)
+    assert r["is_bank"] is True
+    assert r["classification"]["type"] == "成长(优质银行)"
+    assert "长期持有" in r["investment_approach"]["approach"]
+    assert r["pe_trap"]["valuation_anchor"] == "PB + 股息率"
+    assert r["geopolitical_risk"]["risk_types"][0]["id"] == "bank_policy"
+    print(f"✅ test_bank_quality_growth_bank passed (type={r['classification']['type']})")
+
+
+def test_bank_quality_ordinary_bank():
+    """普通银行:ROE 中等(10-12%) -> 周期(普通银行)。"""
+    from fundamental import analyze_fundamental
+    financials = [
+        {"period": "20221231", "net_profit": 100, "revenue": 1000, "roe": 11.0},
+        {"period": "20231231", "net_profit": 95, "revenue": 980, "roe": 10.5},
+        {"period": "20241231", "net_profit": 105, "revenue": 1020, "roe": 10.8},
+    ]
+    r = analyze_fundamental("601398", "工商银行", "银行", pe=6, pb=0.8, financials=financials)
+    assert r["is_bank"] is True
+    assert "普通银行" in r["classification"]["type"]
+    assert "波段操作" in r["investment_approach"]["approach"]
+    print(f"✅ test_bank_quality_ordinary_bank passed (type={r['classification']['type']})")
+
+
+def test_bank_quality_weak_bank():
+    """弱质银行:ROE < 10% -> 周期(弱质银行)。"""
+    from fundamental import analyze_fundamental
+    financials = [
+        {"period": "20221231", "net_profit": 50, "revenue": 1000, "roe": 8.0},
+        {"period": "20231231", "net_profit": 40, "revenue": 950, "roe": 6.5},
+        {"period": "20241231", "net_profit": 35, "revenue": 900, "roe": 5.8},
+    ]
+    r = analyze_fundamental("600015", "华夏银行", "银行", pe=5, pb=0.5, financials=financials)
+    assert r["is_bank"] is True
+    assert "弱质银行" in r["classification"]["type"]
+    assert "观望" in r["investment_approach"]["approach"]
+    print(f"✅ test_bank_quality_weak_bank passed (type={r['classification']['type']})")
+
+
+def test_bank_quality_pb_valuation_anchor():
+    """银行股估值锚是 PB,不是 PE;pe_trap 输出 PB + 股息率。"""
+    from fundamental import analyze_fundamental
+    financials = [
+        {"period": "20231231", "net_profit": 100, "revenue": 1000, "roe": 15.0},
+        {"period": "20241231", "net_profit": 110, "revenue": 1100, "roe": 15.2},
+    ]
+    r = analyze_fundamental("600036", "招商银行", "银行", pe=8, pb=1.2, financials=financials)
+    assert r["pe_trap"]["available"] is True
+    assert r["pe_trap"]["pb"] == 1.2
+    assert "PB" in r["pe_trap"]["interpretation"]
+    print(f"✅ test_bank_quality_pb_valuation_anchor passed (pb={r['pe_trap']['pb']})")
+
+
+def test_bank_quality_pb_missing():
+    """PB 缺失时 pe_trap.available=False,但估值锚仍标注 PB + 股息率。"""
+    from fundamental import analyze_fundamental
+    financials = [
+        {"period": "20231231", "net_profit": 100, "revenue": 1000, "roe": 15.0},
+        {"period": "20241231", "net_profit": 110, "revenue": 1100, "roe": 15.2},
+    ]
+    r = analyze_fundamental("600036", "招商银行", "银行", pe=None, pb=None, financials=financials)
+    assert r["pe_trap"]["available"] is False
+    assert r["pe_trap"]["valuation_anchor"] == "PB + 股息率"
+    print(f"✅ test_bank_quality_pb_missing passed")
+
+
+# ===== 筹码换手率衰减 + 底仓追踪 + ASR/CYQK 测试 =====
+
+def test_chip_decay_turnover_mode():
+    """有流通股本时,使用换手率衰减模型(筹码守恒)。"""
+    from chip_distribution import compute_chip_distribution
+    pv = [(10.0, 1000)] * 60
+    daily = make_chip_daily(pv)
+    # 流通股本 100,000 股,每日 vol=1000 -> turnover=1%
+    bins, chip, meta = compute_chip_distribution(daily, free_float_shares=100000)
+    assert meta["decay_mode"] == "turnover"
+    assert meta["avg_turnover"] is not None and 0 < meta["avg_turnover"] < 0.02
+    print(f"✅ test_chip_decay_turnover_mode passed (mode={meta['decay_mode']}, avg_turnover={meta['avg_turnover']:.4f})")
+
+
+def test_chip_decay_fixed_fallback():
+    """无流通股本时,降级到固定 decay=0.05。"""
+    from chip_distribution import compute_chip_distribution
+    pv = [(10.0, 1000)] * 60
+    daily = make_chip_daily(pv)
+    bins, chip, meta = compute_chip_distribution(daily, free_float_shares=None)
+    assert meta["decay_mode"] == "fixed"
+    assert meta["avg_turnover"] is None
+    print(f"✅ test_chip_decay_fixed_fallback passed (mode={meta['decay_mode']})")
+
+
+def test_asr_indicator():
+    """ASR(活动筹码):±10% 带内筹码占比。横盘时 ASR 应较高。"""
+    from chip_distribution import compute_chip_distribution, compute_asr
+    pv = [(10.0, 1000)] * 60
+    daily = make_chip_daily(pv)
+    bins, chip, _ = compute_chip_distribution(daily)
+    asr = compute_asr(bins, chip, current_close=10.0)
+    assert asr["value"] >= 50, f"横盘时 ASR 应高,got {asr['value']}"
+    assert asr["label"] == "高"
+    print(f"✅ test_asr_indicator passed (ASR={asr['value']:.1f}%, label={asr['label']})")
+
+
+def test_cyqk_profit_ratio():
+    """CYQK 获利比例:横盘时当前价等于筹码密集区,获利比例约 50%。"""
+    from chip_distribution import compute_chip_distribution, compute_cyqk
+    pv = [(10.0, 1000)] * 60
+    daily = make_chip_daily(pv)
+    bins, chip, _ = compute_chip_distribution(daily)
+    cyqk = compute_cyqk(bins, chip, current_close=10.0)
+    # 横盘 + 三角分布,close 在峰位,获利比例应接近 50%
+    assert 30 <= cyqk["win_ratio"] <= 70, f"获利比例应在 30-70%, got {cyqk['win_ratio']}"
+    print(f"✅ test_cyqk_profit_ratio passed (win_ratio={cyqk['win_ratio']:.1f}%, label={cyqk['label']})")
+
+
+def test_bottom_chip_retention_signal():
+    """底仓不动:价格涨 30%+ 但底仓保留率 ≥50% -> 主升浪续涨信号。"""
+    from chip_distribution import compute_bottom_chip_retention
+    # 60 天前在 10 元横盘吸筹(底仓),后 30 天价升到 13+(涨 30%+),但底仓价位筹码仍保留
+    pv = [(10.0, 3000)] * 60 + [(11.0, 800), (12.0, 800), (13.0, 800), (13.5, 800)] * 7 + [(13.5, 500)] * 2
+    daily = make_chip_daily(pv)
+    # 流通股本较小,使换手率较高,但底仓因量大仍保留
+    r = compute_bottom_chip_retention(daily, free_float_shares=200000, lookback_days=30)
+    assert r["available"] is True
+    assert r["price_rise_pct"] >= 0.30, f"价格应涨 30%+, got {r['price_rise_pct']}"
+    # 信号应为"底仓不动"或"底仓部分转移"(依换手率,底仓大量沉淀应保留)
+    assert r["signal"] in ("底仓不动", "底仓部分转移"), f"signal={r['signal']}, retention={r['retention_ratio']}"
+    print(f"✅ test_bottom_chip_retention_signal passed (signal={r['signal']}, retention={r['retention_ratio']}, rise={r['price_rise_pct']:.2f})")
+
+
+def test_bottom_chip_disappearance_signal():
+    """底仓消失:价格涨 30%+,底仓大量转移 -> 见顶信号。"""
+    from chip_distribution import compute_bottom_chip_retention
+    # 60 天前 10 元横盘,后 30 天价升到 14,且 10 元附近持续高换手(底仓被消化)
+    pv = [(10.0, 1000)] * 60 + [(11.0, 5000), (12.0, 5000), (13.0, 5000), (14.0, 5000)] * 7 + [(14.0, 3000)] * 2
+    daily = make_chip_daily(pv)
+    # 流通股本较小 -> 每日换手率高 -> 底仓被快速消化
+    r = compute_bottom_chip_retention(daily, free_float_shares=30000, lookback_days=30)
+    assert r["available"] is True
+    assert r["price_rise_pct"] >= 0.30
+    # 底仓应大量消失(保留率低)
+    assert r["retention_ratio"] < 0.5, f"底仓保留率应低, got {r['retention_ratio']}"
+    print(f"✅ test_bottom_chip_disappearance_signal passed (signal={r['signal']}, retention={r['retention_ratio']}, rise={r['price_rise_pct']:.2f})")
+
+
+def test_enhanced_pattern_main_launch():
+    """低位单峰 + 今日换手 <1.5%(无量突破)= 主升浪信号。"""
+    from chip_distribution import analyze
+    # 80 天 10 元横盘形成低位单峰,最后 1 天价小幅突破且量小
+    pv = [(10.0, 1000)] * 80 + [(10.2, 300), (10.3, 250), (10.4, 200)]
+    daily = make_chip_daily(pv)
+    # 流通股本 100,000 -> 今日 vol=200 -> turnover=0.2%(<1.5%)
+    r = analyze(daily, free_float_shares=100000)
+    pat = r["pattern"]
+    assert pat["pattern"] == "单峰"
+    assert pat["position_label"] == "低位"
+    assert pat["enhanced_signal"] == "主升浪信号", f"expected 主升浪信号, got {pat['enhanced_signal']}"
+    print(f"✅ test_enhanced_pattern_main_launch passed (signal={pat['enhanced_signal']}, turnover={pat['today_turnover']})")
+
+
+def test_enhanced_pattern_top_signal():
+    """高位单峰 + 底仓消失 = 见顶信号。"""
+    from chip_distribution import analyze
+    # 60 天 10 元吸筹底仓,30 天 15 元高位横盘(形成高位单峰)
+    # lookback_days=30 默认:30 天前价 10,现在 15,涨 50%;高换手让底仓消失
+    pv = [(10.0, 1000)] * 60 + [(15.0, 5000)] * 30
+    daily = make_chip_daily(pv)
+    r = analyze(daily, free_float_shares=20000)
+    pat = r["pattern"]
+    assert pat["position_label"] == "高位", f"expected 高位, got {pat['position_label']}"
+    assert pat["enhanced_signal"] == "见顶信号", f"expected 见顶信号, got {pat['enhanced_signal']} (pattern={pat['pattern']}, retention={r['bottom_retention']['retention_ratio']})"
+    print(f"✅ test_enhanced_pattern_top_signal passed (signal={pat['enhanced_signal']}, retention={r['bottom_retention']['retention_ratio']})")
+
+
+def test_chip_analyze_with_float():
+    """端到端:analyze() 接收 free_float_shares,返回 ASR/CYQK/底仓追踪。"""
+    pv = [(10.0, 1000)] * 60 + [(11.0, 1500), (12.0, 1800), (13.0, 2000)]
+    daily = make_chip_daily(pv)
+    r = chip_analyze(daily, free_float_shares=100000)
+    assert "asr" in r
+    assert "cyqk" in r
+    assert "bottom_retention" in r
+    assert r["decay_meta"]["decay_mode"] == "turnover"
+    assert r["asr"]["value"] > 0
+    assert 0 <= r["cyqk"]["win_ratio"] <= 100
+    print(f"✅ test_chip_analyze_with_float passed (ASR={r['asr']['value']:.1f}%, CYQK_WIN={r['cyqk']['win_ratio']:.1f}%, decay={r['decay_meta']['decay_mode']})")
+
+
+def test_recompute_chip_with_float():
+    """端到端:recompute_chip_with_float 用流通股本重算筹码。"""
+    from compute_indicators import compute, recompute_chip_with_float
+    closes = [10 + i * 0.05 for i in range(120)]
+    vols = [1000 + i * 5 for i in range(120)]
+    daily = make_daily(closes, vols)
+    indicators = compute(daily)
+    # 原 compute 用固定 decay
+    assert indicators["chip"]["decay_meta"]["decay_mode"] == "fixed"
+    # 重算用换手率衰减
+    indicators = recompute_chip_with_float(indicators, daily, free_float_shares=500000)
+    assert indicators["chip"]["decay_meta"]["decay_mode"] == "turnover"
+    assert "asr" in indicators["chip"]
+    assert "cyqk" in indicators["chip"]
+    print(f"✅ test_recompute_chip_with_float passed (decay_mode={indicators['chip']['decay_meta']['decay_mode']}, ASR={indicators['chip']['asr']['value']:.1f}%)")
+
+
 if __name__ == "__main__":
     test_position_percentile()
     test_position_label()
@@ -883,4 +1108,20 @@ if __name__ == "__main__":
     test_roic_stability_no_periods_fallback()
     test_roic_stability_only_quarterly_no_annual()
     test_siyuan_industry_fallback()
+    test_is_bank_detection()
+    test_bank_quality_growth_bank()
+    test_bank_quality_ordinary_bank()
+    test_bank_quality_weak_bank()
+    test_bank_quality_pb_valuation_anchor()
+    test_bank_quality_pb_missing()
+    test_chip_decay_turnover_mode()
+    test_chip_decay_fixed_fallback()
+    test_asr_indicator()
+    test_cyqk_profit_ratio()
+    test_bottom_chip_retention_signal()
+    test_bottom_chip_disappearance_signal()
+    test_enhanced_pattern_main_launch()
+    test_enhanced_pattern_top_signal()
+    test_chip_analyze_with_float()
+    test_recompute_chip_with_float()
     print("\n🎉 All tests passed!")
