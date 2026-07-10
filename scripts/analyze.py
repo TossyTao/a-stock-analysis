@@ -70,6 +70,20 @@ def analyze(code_or_name: str, days: int = 120, include_fundamental: bool = True
         except Exception:
             pass
 
+    # 换手率指标 + 量价细化(需要流通股本)
+    if free_float_shares is not None:
+        try:
+            from compute_indicators import compute_turnover, compute_volume_price_detail
+            indicators["turnover"] = compute_turnover(raw["daily"], free_float_shares)
+            position_label = indicators.get("position", {}).get("label", "")
+            indicators["volume_price_detail"] = compute_volume_price_detail(
+                raw["daily"],
+                indicators["turnover"],
+                position_label,
+            )
+        except Exception:
+            pass
+
     # 拉取主力资金流(失败不阻塞主流程)
     try:
         capital_flow = fetch_capital_flow(raw["code"], days=60)
@@ -87,6 +101,13 @@ def analyze(code_or_name: str, days: int = 120, include_fundamental: bool = True
         )
     except Exception:
         pass
+
+    # 拉取最近新闻(失败不阻塞主流程)
+    try:
+        from fetch_news import fetch_news
+        indicators["news"] = fetch_news(raw["code"], limit=10, lookback_days=30)
+    except Exception as e:
+        indicators["news"] = {"available": False, "error": str(e)}
 
     return {
         "basic": {

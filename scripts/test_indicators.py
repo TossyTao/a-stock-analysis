@@ -10,6 +10,7 @@ from compute_indicators import (
     position_percentile, position_label, vol_ma_cross, vol_ratio,
     is_ground_vol, quadrant, trend_5day, top_divergence, bottom_divergence,
     breakout_3day, detect_traps, compute,
+    compute_turnover, compute_volume_price_detail,
 )
 from chip_distribution import (
     compute_chip_distribution, find_peaks, classify_pattern,
@@ -22,6 +23,9 @@ from fundamental import (
     classify_by_narrative, compute_gross_margin_trend,
     compute_revenue_growth, compute_operating_profit_quality,
     classify_geopolitical_risk,
+)
+from fetch_news import (
+    _classify_sentiment, _compute_sentiment_summary, _extract_key_events,
 )
 import pandas as pd
 
@@ -2120,6 +2124,352 @@ def test_cross_validate_unavailable():
     print("✅ test_cross_validate_unavailable passed")
 
 
+def test_ths_realtime_parse():
+    """THS 即时数据解析:中文金额"亿/万" -> 元,代码归一化 6 位。"""
+    from fetch_capital_flow import _parse_ths_realtime
+    import pandas as pd
+
+    df = pd.DataFrame([
+        {"code": "002472", "name": "双环传动", "price": 42.2, "pct_chg": -0.75,
+         "turnover_rate": 3.22, "inflow": 483000000.0, "outflow": 545000000.0,
+         "net": -61349600.0, "turnover": 1044000000.0},
+        {"code": "600519", "name": "贵州茅台", "price": 1500, "pct_chg": 0.5,
+         "turnover_rate": 0.2, "inflow": 1e9, "outflow": 8e8,
+         "net": 2e8, "turnover": 2e9},
+    ])
+    r = _parse_ths_realtime("002472", df)
+    assert r is not None
+    assert r["source"] == "ths"
+    assert r["available"] is True
+    assert r["days_returned"] == 1
+    assert r["today"]["main_net_amount"] == -61349600.0
+    assert r["today"]["main_net_pct"] == -5.88  # -61349600 / 1044000000 * 100
+    assert r["signals"]["main_force_action"] == "派发"
+    assert r["signals"]["strength"] == "中"
+    assert r["trend"]["available"] is False
+
+    # 茅台(净流入 2 亿,占比 10%) -> 强吸筹
+    r2 = _parse_ths_realtime("600519", df)
+    assert r2["signals"]["main_force_action"] == "吸筹"
+    assert r2["signals"]["strength"] == "强"
+
+    # 不存在的代码
+    r3 = _parse_ths_realtime("999999", df)
+    assert r3 is None
+    print("✅ test_ths_realtime_parse passed")
+
+
+def test_ths_realtime_signal_thresholds():
+    """THS 简化信号阈值:弱/中/强三档基于 |main_net_pct|。"""
+    from fetch_capital_flow import _parse_ths_realtime
+    import pandas as pd
+
+    base = {"price": 10.0, "pct_chg": 0.0, "turnover_rate": 1.0}
+
+    # 弱:占比 < 5%
+    df_weak = pd.DataFrame([{
+        "code": "000001", "name": "X", "inflow": 1.01e8, "outflow": 1.0e8,
+        "net": 1e6, "turnover": 1e9, **base,
+    }])
+    r = _parse_ths_realtime("000001", df_weak)
+    assert r["signals"]["strength"] == "弱"
+    assert r["signals"]["main_force_action"] == "吸筹"
+
+    # 中:占比 5-10%
+    df_mid = pd.DataFrame([{
+        "code": "000001", "name": "X", "inflow": 1.6e8, "outflow": 1.0e8,
+        "net": 6e7, "turnover": 1e9, **base,
+    }])
+    r = _parse_ths_realtime("000001", df_mid)
+    assert r["signals"]["strength"] == "中"
+    assert r["signals"]["main_force_action"] == "吸筹"
+
+    # 强:占比 >= 10%
+    df_strong = pd.DataFrame([{
+        "code": "000001", "name": "X", "inflow": 1.15e8, "outflow": 1.0e8,
+        "net": 1.5e8, "turnover": 1e9, **base,
+    }])
+    r = _parse_ths_realtime("000001", df_strong)
+    assert r["signals"]["strength"] == "强"
+    assert r["signals"]["main_force_action"] == "吸筹"
+
+    # 中性:净额为 0
+    df_neutral = pd.DataFrame([{
+        "code": "000001", "name": "X", "inflow": 1e8, "outflow": 1e8,
+        "net": 0, "turnover": 1e9, **base,
+    }])
+    r = _parse_ths_realtime("000001", df_neutral)
+    assert r["signals"]["main_force_action"] == "中性"
+    print("✅ test_ths_realtime_signal_thresholds passed")
+
+
+def test_cross_validate_ths_source_confidence_cap():
+    """THS 降级源(只有今日数据)置信度上限为"中"。"""
+    from chip_distribution import cross_validate_chip_capital
+
+    short_term_chip = {
+        "available": True,
+        "trend": {
+            "peak_migration": "向上迁移",
+            "concentration_trend": "上升",
+            "cyqk_trend": "稳定",
+        },
+    }
+    # 东财源:强吸筹 + 筹码集中 -> 高置信度
+    capital_em = {
+        "available": True,
+        "source": "eastmoney",
+        "today": {"main_net_amount": 2e8, "main_net_pct": 15},
+        "cumulative": {"5d": {"main_net_amount": 5e8}},
+        "trend": {"available": True, "consecutive_days": 5, "ma_cross": "金叉"},
+        "signals": {"main_force_action": "吸筹", "strength": "强"},
+    }
+    r_em = cross_validate_chip_capital({"available": True}, short_term_chip, capital_em)
+    assert r_em["main_force_intent"] == "强吸筹"
+    assert r_em["confidence"] == "高"
+
+    # THS 源:同样信号 -> 置信度降为"中"
+    capital_ths = {
+        "available": True,
+        "source": "ths",
+        "today": {"main_net_amount": 2e8, "main_net_pct": 15},
+        "cumulative": {"today": {"main_net_amount": 2e8}},
+        "trend": {"available": False, "reason": "THS 即时数据无日线序列"},
+        "signals": {"main_force_action": "吸筹", "strength": "强"},
+    }
+    r_ths = cross_validate_chip_capital({"available": True}, short_term_chip, capital_ths)
+    assert r_ths["main_force_intent"] == "强吸筹"
+    assert r_ths["confidence"] == "中"  # 被 THS 源限制
+    # evidence 应标注 THS 降级
+    assert any("THS" in e or "降级" in e for e in r_ths["evidence"])
+    print(f"✅ test_cross_validate_ths_source_confidence_cap passed (em={r_em['confidence']}, ths={r_ths['confidence']})")
+
+
+def test_cross_validate_ths_outflow_distribution():
+    """THS 降级源 + 主峰上移 + 资金流出 -> 派发,置信度中。"""
+    from chip_distribution import cross_validate_chip_capital
+
+    short_term_chip = {
+        "available": True,
+        "trend": {
+            "peak_migration": "向上迁移",
+            "concentration_trend": "稳定",
+            "cyqk_trend": "稳定",
+        },
+    }
+    capital_ths = {
+        "available": True,
+        "source": "ths",
+        "today": {"main_net_amount": -6e7, "main_net_pct": -6},
+        "cumulative": {"today": {"main_net_amount": -6e7}},
+        "trend": {"available": False, "reason": "THS"},
+        "signals": {"main_force_action": "派发", "strength": "中"},
+    }
+    r = cross_validate_chip_capital({"available": True}, short_term_chip, capital_ths)
+    assert r["main_force_intent"] == "派发"
+    assert r["confidence"] == "中"  # THS 限制 + 中等强度
+    print(f"✅ test_cross_validate_ths_outflow_distribution passed (intent={r['main_force_intent']}, confidence={r['confidence']})")
+
+
+# ========== 换手率 + 量价细化测试 ==========
+
+def test_turnover_calculation():
+    """换手率计算正确性:266117手 / 8.5亿股 = 3.13%"""
+    daily = make_daily([10.0] * 30, [266117] * 30)
+    r = compute_turnover(daily, 8.5e8)
+    assert r["available"] is True
+    assert abs(r["today"] - 3.13) < 0.1, f"today={r['today']}"
+    print(f"✅ test_turnover_calculation passed (today={r['today']}%)")
+
+
+def test_turnover_label_cold():
+    """换手率<1% -> 冷门"""
+    # 8.5亿股本,<1% 需要 vol < 85000 手
+    daily = make_daily([10.0] * 30, [50000] * 30)
+    r = compute_turnover(daily, 8.5e8)
+    assert r["label"] == "冷门", f"label={r['label']}, today={r['today']}"
+    print(f"✅ test_turnover_label_cold passed (today={r['today']}%, label={r['label']})")
+
+
+def test_turnover_label_normal():
+    """换手率 1-3% -> 常态"""
+    # 1.5% = 127500 手
+    daily = make_daily([10.0] * 30, [127500] * 30)
+    r = compute_turnover(daily, 8.5e8)
+    assert r["label"] == "常态", f"label={r['label']}, today={r['today']}"
+    print(f"✅ test_turnover_label_normal passed (today={r['today']}%, label={r['label']})")
+
+
+def test_turnover_label_active():
+    """换手率 5-10% -> 活跃"""
+    # 7% = 595000 手
+    daily = make_daily([10.0] * 30, [595000] * 30)
+    r = compute_turnover(daily, 8.5e8)
+    assert r["label"] == "活跃", f"label={r['label']}, today={r['today']}"
+    print(f"✅ test_turnover_label_active passed (today={r['today']}%, label={r['label']})")
+
+
+def test_turnover_label_warning():
+    """换手率>15% -> 套现警戒"""
+    # 18% = 1530000 手
+    daily = make_daily([10.0] * 30, [1530000] * 30)
+    r = compute_turnover(daily, 8.5e8)
+    assert r["label"] == "套现警戒", f"label={r['label']}, today={r['today']}"
+    print(f"✅ test_turnover_label_warning passed (today={r['today']}%, label={r['label']})")
+
+
+def test_history_top_detection():
+    """120日内2次天量(换手>=10%) -> is_top_signal=True"""
+    # 120 天,平均 vol=100000(换手 1.18%),第 50、100 天 vol=900000(换手 10.59%)
+    vols = [100000] * 120
+    vols[49] = 900000
+    vols[99] = 950000
+    daily = make_daily([10.0] * 120, vols)
+    r = compute_turnover(daily, 8.5e8)
+    assert r["history_top_count"] == 2, f"history_top_count={r['history_top_count']}"
+    assert r["is_top_signal"] is True, f"is_top_signal={r['is_top_signal']}"
+    print(f"✅ test_history_top_detection passed (count={r['history_top_count']}, is_top={r['is_top_signal']})")
+
+
+def test_volume_price_flat_low_position():
+    """低位量增价平 -> 吸筹"""
+    # 价格长期下跌后稳定在 10(低位),今日量增 + 价平
+    closes = [20.0] * 10 + [15.0] * 10 + [10.0] * 10
+    vols = [100000] * 30
+    vols[-1] = 150000  # 今日量增 50%
+    daily = make_daily(closes, vols)
+    turnover = compute_turnover(daily, 8.5e8)
+    r = compute_volume_price_detail(daily, turnover, "低位")
+    assert r["available"] is True
+    assert r["primary_signal"] == "量增价平-吸筹", f"signal={r['primary_signal']}"
+    print(f"✅ test_volume_price_flat_low_position passed (signal={r['primary_signal']})")
+
+
+def test_volume_price_flat_high_position():
+    """高位量增价平 -> 出货"""
+    # 价格从 5 涨到 10(高位),今日量增 + 价平
+    closes = [5.0] * 10 + [7.0] * 10 + [10.0] * 10
+    vols = [100000] * 30
+    vols[-1] = 150000
+    daily = make_daily(closes, vols)
+    turnover = compute_turnover(daily, 8.5e8)
+    r = compute_volume_price_detail(daily, turnover, "高位")
+    assert r["available"] is True
+    assert r["primary_signal"] == "量增价平-出货", f"signal={r['primary_signal']}"
+    print(f"✅ test_volume_price_flat_high_position passed (signal={r['primary_signal']})")
+
+
+def test_shrink_up_high_control():
+    """均线陡峭 + 缩量上涨 -> 高控盘"""
+    # 5日均线陡峭:5天内从 10 涨到 11.1(日均斜率 >2%)
+    # ma5[-1] ≈ 10.92, ma5[-5] ≈ 10.5, slope = (10.92-10.5)/10.5/5 ≈ 0.008 -> 不够陡
+    # 需要更陡:5天从 10 涨到 12(日均 4%)
+    closes = [8.0, 8.5, 9.0, 9.5, 10.0, 10.5, 11.0, 11.5, 11.8, 12.0]
+    closes = [c * 0.9 for c in closes[:5]] + closes  # 前面加 5 天铺垫
+    vols = [200000] * 10 + [180000, 170000, 160000, 150000, 100000]  # 最后一天量缩
+    daily = make_daily(closes, vols)
+    turnover = compute_turnover(daily, 8.5e8)
+    r = compute_volume_price_detail(daily, turnover, "高位")
+    # 今日价涨 + 量缩 + 均线陡峭 -> 高控盘
+    signals = [s["signal"] for s in r["signals"]]
+    assert "量缩价涨-高控盘" in signals, f"signals={signals}, ma5_slope={r['ma5_slope']}"
+    print(f"✅ test_shrink_up_high_control passed (signals={signals}, slope={r['ma5_slope']})")
+
+
+def test_shrink_up_capital_exhausted():
+    """均线疲软 + 缩量上涨 -> 资金枯竭"""
+    # 价格长期稳定 + 缓涨,均线疲软
+    closes = [10.0] * 25 + [10.05, 10.06, 10.07, 10.08, 10.10]
+    vols = [100000] * 25 + [95000, 90000, 85000, 80000, 70000]  # 量缩
+    daily = make_daily(closes, vols)
+    turnover = compute_turnover(daily, 8.5e8)
+    r = compute_volume_price_detail(daily, turnover, "中位")
+    signals = [s["signal"] for s in r["signals"]]
+    assert "量缩价涨-资金枯竭" in signals, f"signals={signals}, ma5_slope={r['ma5_slope']}"
+    print(f"✅ test_shrink_up_capital_exhausted passed (signals={signals}, slope={r['ma5_slope']})")
+
+
+def test_extreme_ground_vol():
+    """换手<1% + 量缩>30% -> 极致地量"""
+    # 换手 <1%:vol < 85000 手
+    # 量缩 >30%:今日 vol < 昨日 × 0.7
+    closes = [10.0] * 30
+    vols = [80000] * 29 + [50000]  # 最后一天量缩 37.5%
+    daily = make_daily(closes, vols)
+    turnover = compute_turnover(daily, 8.5e8)
+    r = compute_volume_price_detail(daily, turnover, "低位")
+    signals = [s["signal"] for s in r["signals"]]
+    assert "极致地量" in signals, f"signals={signals}, today_turnover={turnover['today']}"
+    print(f"✅ test_extreme_ground_vol passed (signals={signals}, turnover={turnover['today']}%)")
+
+
+# ========== 新闻舆情测试 ==========
+
+def test_news_classify_sentiment_positive():
+    """标题命中"净利预增" -> 利好"""
+    s, kw = _classify_sentiment("公司净利预增1099%", "业绩内容")
+    assert s == "利好", f"sentiment={s}"
+    assert "净利预增" in kw, f"keywords={kw}"
+    print(f"✅ test_news_classify_sentiment_positive passed (sentiment={s}, kw={kw})")
+
+
+def test_news_classify_sentiment_negative():
+    """标题命中"减持" -> 利空"""
+    s, kw = _classify_sentiment("股东减持计划", "内容")
+    assert s == "利空", f"sentiment={s}"
+    assert "减持" in kw, f"keywords={kw}"
+    print(f"✅ test_news_classify_sentiment_negative passed (sentiment={s}, kw={kw})")
+
+
+def test_news_classify_sentiment_neutral():
+    """无关键词命中 -> 中性"""
+    s, kw = _classify_sentiment("今日天气不错", "正常内容")
+    assert s == "中性", f"sentiment={s}"
+    assert kw == [], f"keywords={kw}"
+    print(f"✅ test_news_classify_sentiment_neutral passed (sentiment={s})")
+
+
+def test_news_classify_sentiment_title_weight():
+    """标题权重 ×2:标题命中"涨停"(2分) vs 内容命中"减持"(1分) -> 利好(标题方胜)"""
+    s, kw = _classify_sentiment("涨停", "减持")
+    assert s == "利好", f"sentiment={s} (标题2分应胜内容1分)"
+    assert "涨停" in kw and "减持" in kw, f"keywords={kw}"
+    print(f"✅ test_news_classify_sentiment_title_weight passed (sentiment={s}, 标题权重×2生效)")
+
+
+def test_news_sentiment_summary_dominant():
+    """6 利好 + 2 利空 + 2 中性 -> 偏正面(60%)"""
+    sentiments = ["利好"] * 6 + ["利空"] * 2 + ["中性"] * 2
+    r = _compute_sentiment_summary(sentiments)
+    assert r["dominant"] == "利好", f"dominant={r['dominant']}"
+    assert r["dominant_pct"] == 60.0, f"pct={r['dominant_pct']}"
+    assert r["label"] == "偏正面", f"label={r['label']}"
+    print(f"✅ test_news_sentiment_summary_dominant passed (label={r['label']}, pct={r['dominant_pct']}%)")
+
+
+def test_news_sentiment_summary_divergence():
+    """3 利好 + 3 利空 + 4 中性 -> 分歧(无一方占 60%+)"""
+    sentiments = ["利好"] * 3 + ["利空"] * 3 + ["中性"] * 4
+    r = _compute_sentiment_summary(sentiments)
+    # dominant 是 max,neutral=4 是最多,但 pct=40% < 60% -> 分歧
+    assert r["label"] == "分歧", f"label={r['label']}, dominant={r['dominant']}, pct={r['dominant_pct']}"
+    print(f"✅ test_news_sentiment_summary_divergence passed (label={r['label']})")
+
+
+def test_news_key_events_extraction():
+    """从标题提取关键事件 + 去重"""
+    news_list = [
+        {"title": "公司净利预增1099%,业绩大爆发"},
+        {"title": "股东减持计划公布"},
+        {"title": "公司净利预增1099%", "content": ""},  # 重复,应被去重
+        {"title": "今日天气"},
+    ]
+    events = _extract_key_events(news_list, max_events=5)
+    assert len(events) >= 2, f"events={events}"
+    assert len(events) <= 3, f"events={events} (应去重)"
+    print(f"✅ test_news_key_events_extraction passed (events={events})")
+
+
 if __name__ == "__main__":
     test_position_percentile()
     test_position_label()
@@ -2263,4 +2613,28 @@ if __name__ == "__main__":
     test_cross_validate_distribution()
     test_cross_validate_contradiction()
     test_cross_validate_unavailable()
+    test_ths_realtime_parse()
+    test_ths_realtime_signal_thresholds()
+    test_cross_validate_ths_source_confidence_cap()
+    test_cross_validate_ths_outflow_distribution()
+    # 换手率 + 量价细化
+    test_turnover_calculation()
+    test_turnover_label_cold()
+    test_turnover_label_normal()
+    test_turnover_label_active()
+    test_turnover_label_warning()
+    test_history_top_detection()
+    test_volume_price_flat_low_position()
+    test_volume_price_flat_high_position()
+    test_shrink_up_high_control()
+    test_shrink_up_capital_exhausted()
+    test_extreme_ground_vol()
+    # 新闻舆情
+    test_news_classify_sentiment_positive()
+    test_news_classify_sentiment_negative()
+    test_news_classify_sentiment_neutral()
+    test_news_classify_sentiment_title_weight()
+    test_news_sentiment_summary_dominant()
+    test_news_sentiment_summary_divergence()
+    test_news_key_events_extraction()
     print("\n🎉 All tests passed!")

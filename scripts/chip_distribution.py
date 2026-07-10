@@ -773,13 +773,15 @@ def cross_validate_chip_capital(
     cf_strength = cf_signals.get("strength", "弱")  # 强/中/弱
     cf_trend = capital_flow.get("trend", {})
     cf_consecutive = cf_trend.get("consecutive_days", 0)
+    cf_source = capital_flow.get("source", "eastmoney")  # eastmoney / ths
+    cf_trend_available = cf_trend.get("available", False)
 
     # 今日主力净额
     today = capital_flow.get("today", {})
     today_main_net = today.get("main_net_amount") or 0
     today_main_pct = today.get("main_net_pct") or 0
 
-    # 5日累计
+    # 5日累计(东财数据有,THS fallback 没有)
     cum_5d = capital_flow.get("cumulative", {}).get("5d", {})
     cum_5d_net = cum_5d.get("main_net_amount") or 0
 
@@ -788,7 +790,12 @@ def cross_validate_chip_capital(
     evidence.append(f"集中度{conc_trend}")
     evidence.append(f"主力资金{cf_action}({cf_strength})")
     evidence.append(f"今日主力净额 {today_main_net:,.0f}({today_main_pct}%)")
-    evidence.append(f"连续 {abs(cf_consecutive)} 日{'流入' if cf_consecutive > 0 else '流出' if cf_consecutive < 0 else '无持续'}")
+    if cf_trend_available:
+        evidence.append(f"连续 {abs(cf_consecutive)} 日{'流入' if cf_consecutive > 0 else '流出' if cf_consecutive < 0 else '无持续'}")
+        if cum_5d_net:
+            evidence.append(f"5日累计主力净额 {cum_5d_net:,.0f}")
+    else:
+        evidence.append("资金流仅今日数据(THS 降级源),无趋势/累计")
 
     # ---- 交叉验证逻辑 ----
     # 资金方向:inflow(净流入)/ outflow(净流出)/ neutral
@@ -878,6 +885,11 @@ def cross_validate_chip_capital(
         confidence = "高"
     if cf_strength == "弱" and confidence == "高" and intent not in ("强吸筹", "强派发"):
         confidence = "中"
+
+    # THS 降级源只有今日数据,置信度最高为"中"(无趋势/连续性确认)
+    if cf_source == "ths" and confidence == "高":
+        confidence = "中"
+        interpretation += "(注:资金流仅今日快照,置信度受限于数据源)"
 
     return {
         "available": True,

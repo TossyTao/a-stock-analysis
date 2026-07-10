@@ -554,3 +554,139 @@ def recompute_chip_with_float(
     except Exception:
         pass
     return indicators
+
+
+def compute_turnover(daily: List[Dict[str, Any]], free_float_shares: float) -> Dict[str, Any]:
+    """计算换手率指标(基于流通股本)。
+
+    换手率 = 成交量(股) / 流通股本 × 100%
+    A股成交量单位是"手",1 手 = 100 股。
+    分级:<1% 冷门 / 1-3% 常态 / 3-5% 偏活跃 / 5-10% 活跃 / 10-15% 高度活跃 / >15% 套现警戒
+    历史天量:120日内换手率 >= 最大换手率 90% 的天数;≥2 次 = 阶段顶部信号
+    """
+    if not free_float_shares or free_float_shares <= 0:
+        return {"available": False, "reason": "无流通股本"}
+
+    df = pd.DataFrame(daily)
+    if "volume" not in df.columns or len(df) < 1:
+        return {"available": False, "reason": "数据不足"}
+
+    vol_shares = pd.to_numeric(df["volume"], errors="coerce").astype(float) * 100  # 手 -> 股
+    turnover = vol_shares / free_float_shares * 100
+
+    today = float(turnover.iloc[-1])
+    ma5 = float(turnover.tail(5).mean()) if len(turnover) >= 5 else today
+    ma20 = float(turnover.tail(20).mean()) if len(turnover) >= 20 else today
+    max_20d = float(turnover.tail(20).max()) if len(turnover) >= 1 else 0
+    window_120 = min(120, len(turnover))
+    max_120d = float(turnover.tail(window_120).max()) if window_120 >= 1 else 0
+
+    if today < 1:
+        label = "冷门"
+    elif today < 3:
+        label = "常态"
+    elif today < 5:
+        label = "偏活跃"
+    elif today < 10:
+        label = "活跃"
+    elif today < 15:
+        label = "高度活跃"
+    else:
+        label = "套现警戒"
+
+    threshold = max_120d * 0.9 if max_120d > 0 else 0
+    # 历史天量:120日内换手率 >= 10%(绝对阈值,对应"高度活跃"以上)
+    HISTORY_TOP_THRESHOLD = 10.0
+    history_top_count = int((turnover.tail(window_120) >= HISTORY_TOP_THRESHOLD).sum())
+    is_top_signal = history_top_count >= 2  # 2次天量 = 阶段顶部
+
+    return {
+        "available": True,
+        "today": round(today, 2),
+        "ma5": round(ma5, 2),
+        "ma20": round(ma20, 2),
+        "max_20d": round(max_20d, 2),
+        "max_120d": round(max_120d, 2),
+        "label": label,
+        "history_top_count": history_top_count,
+        "is_top_signal": is_top_signal,
+        "today_vs_max120d": round(today / max_120d, 2) if max_120d > 0 else 0,
+    }
+
+
+def compute_volume_price_detail(
+    daily: List[Dict[str, Any]],
+    turnover: Dict[str, Any],
+    position_label: str,
+) -> Dict[str, Any]:
+    """细化量价组合判断(补充矩阵1缺的组合)。
+
+    补充:
+    - 量增价平(低位=吸筹,高位=出货)
+    - 缩量上涨二分(均线陡峭=高控盘 vs 均线疲软=资金枯竭)
+    - 极致地量(换手<1% + 量缩=见底信号)
+    - 历史天量警戒(高位 + 今日换手接近120日天量=派发信号)
+    """
+    df = to_df(daily)
+    if len(df) < 5:
+        return {"available": False, "reason": "数据不足"}
+
+    for c in ["close", "volume"]:
+        if c not in df.columns:
+            return {"available": False, "reason": f"缺 {c} 列"}
+
+    today = df.iloc[-1]
+    yest = df.iloc[-2]
+
+    yest_vol = float(yest["volume"]) if len(df) >= 2 else 0
+    yest_close = float(yest["close"]) if len(df) >= 2 else 0
+    vol_chg = (float(today["volume"]) - yest_vol) / yest_vol if yest_vol > 0 else 0
+    price_chg = (float(today["close"]) - yest_close) / yest_close if yest_close > 0 else 0
+
+    # 5日均线斜率(归一化为日均变化率)
+    ma5 = df["close"].astype(float).rolling(5).mean()
+    if len(ma5) >= 5 and ma5.iloc[-5] > 0:
+        ma5_slope = (float(ma5.iloc[-1]) - float(ma5.iloc[-5])) / float(ma5.iloc[-5]) / 5
+    else:
+        ma5_slope = 0
+
+    is_high = "高" in position_label
+    is_low = "低" in position_label
+
+    signals = []
+
+    # 量增价平(量增>10% + |价涨|<1%)
+    if vol_chg > 0.1 and abs(price_chg) < 0.01:
+        if is_high:
+            signals.append({"signal": "量增价平-出货", "interpretation": "高位量增价平 = 主力派发,警惕"})
+        else:
+            signals.append({"signal": "量增价平-吸筹", "interpretation": "低位量增价平 = 主力吸筹,等放量启动"})
+
+    # 缩量上涨二分(量缩>10% + 价涨>0)
+    if vol_chg < -0.1 and price_chg > 0:
+        if ma5_slope > 0.02:  # 5日均线日均斜率>2%(陡峭)
+            signals.append({"signal": "量缩价涨-高控盘", "interpretation": "均线陡峭 + 缩量上涨 = 高控盘,易连板,拿稳"})
+        else:
+            signals.append({"signal": "量缩价涨-资金枯竭", "interpretation": "均线疲软 + 缩量上涨 = 买盘枯竭,危险"})
+
+    # 极致地量(换手率<1% + 量缩>30%)
+    today_turnover = turnover.get("today", 99) if turnover else 99
+    if today_turnover < 1 and vol_chg < -0.3:
+        signals.append({"signal": "极致地量", "interpretation": "换手<1% + 量缩 = 见底信号"})
+
+    # 历史天量警戒(今日换手率 >= 120日最大的 90% + 最大换手>=10% + 高位)
+    today_vs_max = turnover.get("today_vs_max120d", 0) if turnover else 0
+    max_120d = turnover.get("max_120d", 0) if turnover else 0
+    if today_vs_max >= 0.9 and max_120d >= 10 and is_high:
+        signals.append({"signal": "历史天量警戒", "interpretation": "今日换手接近120日天量 + 高位 = 派发信号"})
+
+    return {
+        "available": True,
+        "vol_chg": round(vol_chg, 3),
+        "price_chg": round(price_chg, 4),
+        "ma5_slope": round(ma5_slope, 4),
+        "is_high": is_high,
+        "is_low": is_low,
+        "signals": signals,
+        "primary_signal": signals[0]["signal"] if signals else "none",
+    }

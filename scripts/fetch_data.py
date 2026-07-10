@@ -15,6 +15,7 @@ import os
 import pickle
 import random
 import re
+import socket
 import sys
 import time
 from datetime import datetime, timedelta
@@ -23,6 +24,15 @@ import akshare as ak
 import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter
+
+# 强制 IPv4:东方财富 push2his.eastmoney.com 个股资金流/K线接口在 TLS 握手后
+# 即被服务端选择性丢弃连接(Empty reply),实测与 IPv6/IPv4 无关,但保留 IPv4
+# 偏好可减少 IPv6 路由抖动带来的额外失败。
+# 真因:东财对带 secid= 参数的个股 API 做了反爬限制(聚合接口如 clist/kamt 不受影响)。
+import urllib3.util.connection as _urllib3_cn
+def _force_ipv4_family():
+    return socket.AF_INET
+_urllib3_cn.allowed_gai_family = _force_ipv4_family
 from urllib3.util.retry import Retry
 
 # 强化浏览器 headers:模拟真实 Chrome 请求,避免被 TLS/UA 指纹检测拦截
@@ -131,6 +141,7 @@ _CACHE_TTL = {
     "name": timedelta(days=7),         # 股票名称表:7 天
     "research_report": timedelta(days=1),  # 研报:1 天
     "capital_flow": timedelta(hours=4),    # 主力资金流:4 小时(盘中+盘后)
+    "news": timedelta(hours=4),            # 新闻舆情:4 小时(盘中可能更新)
 }
 
 

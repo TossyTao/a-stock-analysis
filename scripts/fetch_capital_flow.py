@@ -1,25 +1,33 @@
 """东方财富个股主力资金流拉取 + 吸筹/派发信号判定。
 
-数据源:东方财富 push2his.eastmoney.com/api/qt/stock/fflow/daykline/get
-  - 来源页:data.eastmoney.com/zjlx/detail.html
-  - 返回 ~121 天日线资金流,klines 数组每行 15 字段:
-    date, main_net, small_net, mid_net, large_net, super_large_net,
-    main_pct, small_pct, mid_pct, large_pct, super_large_pct,
-    close, pct_chg, "", ""
-  - 主力 = 超大单(单笔>100万) + 大单(20-100万),东财标准
+数据源优先级:
+  1. 东方财富 push2his.eastmoney.com/api/qt/stock/fflow/daykline/get
+     返回 ~121 天日线资金流,klines 数组每行 15 字段:
+     date, main_net, small_net, mid_net, large_net, super_large_net,
+     main_pct, small_pct, mid_pct, large_pct, super_large_pct,
+     close, pct_chg, "", ""
+     主力 = 超大单(单笔>100万) + 大单(20-100万),东财标准
+  2. 同花顺 data.10jqka.com.cn/funds/ggzjl/ (fallback)
+     当东财 push2his 对带 secid 的个股 API 做反爬拦截时启用。
+     只返回今日全市场快照(流入/流出/净额/成交额),无日线序列。
+     通过 akshare.stock_fund_flow_individual(symbol="即时") 拉取,需 hexin-v token。
 
-注:akshare 的 stock_individual_fund_flow 也打这个 endpoint,但限流严格。
-直接用 fetch_data._session(浏览器 headers + 连接池 + 重试)更稳。
-
-判定规则:
+判定规则(东财数据):
   - 吸筹:连续≥3日主力净流入 + 5日均主力净占比≥5%
   - 派发:连续≥3日主力净流出 + 5日均主力净占比≤-5%
   - 强吸筹/强派发:连续≥5日 + 5日均占比≥10%(吸筹)/≤-10%(派发)
   - 中性:其他
 
+判定规则(THS fallback):
+  - 吸筹:今日净额 > 0 且 占比≥5%
+  - 派发:今日净额 < 0 且 占比≤-5%
+  - 强度:|占比|≥10%=强, ≥5%=中, <5%=弱
+  - 中性:|占比|<5%
+
 复用 fetch_data 的网络层(Session + 限流 + 重试 + 缓存)。
 """
 import hashlib
+from datetime import datetime
 from typing import Dict, Any, List, Optional
 
 import pandas as pd
@@ -271,6 +279,183 @@ def _compute_signals(df: pd.DataFrame, trend: Dict[str, Any],
     }
 
 
+# ---------- THS fallback(东财反爬时的降级路径) ----------
+
+_THS_CACHE_KEY = "ths_realtime_all_stocks"
+
+
+def _fetch_ths_realtime_all() -> Optional[pd.DataFrame]:
+    """拉取同花顺"即时"全市场个股资金流(5194 只,~15s)。
+
+    通过 akshare.stock_fund_flow_individual(symbol="即时") 调用,
+    内部使用 hexin-v token(JS 挑战)绕过反爬。
+
+    Returns:
+        DataFrame[code, name, price, pct_chg, turnover_rate,
+                 inflow, outflow, net, turnover] 或 None(失败)
+    """
+    cached = _cache_get("capital_flow", _THS_CACHE_KEY)
+    if cached is not None:
+        try:
+            return pd.DataFrame(cached)
+        except Exception:
+            pass
+
+    try:
+        import akshare as ak
+    except ImportError:
+        return None
+
+    try:
+        df = ak.stock_fund_flow_individual(symbol="即时")
+    except Exception as e:
+        return None
+
+    if df is None or len(df) == 0:
+        return None
+
+    # 归一化列名(akshare 即时返回中文列名,已去单位后缀)
+    col_map = {
+        "股票代码": "code_raw",
+        "股票简称": "name",
+        "最新价": "price",
+        "涨跌幅": "pct_chg",
+        "换手率": "turnover_rate",
+        "流入资金": "inflow",
+        "流出资金": "outflow",
+        "净额": "net",
+        "成交额": "turnover",
+    }
+    df = df.rename(columns=col_map)
+
+    # 解析中文金额("1.05亿" / "3596.95万")为元
+    def _parse_amount(s):
+        if pd.isna(s) or s == "" or s == "0.00":
+            return 0.0
+        s = str(s).strip()
+        try:
+            if s.endswith("亿"):
+                return float(s[:-1]) * 1e8
+            if s.endswith("万"):
+                return float(s[:-1]) * 1e4
+            return float(s)
+        except ValueError:
+            return 0.0
+
+    for col in ["inflow", "outflow", "net", "turnover"]:
+        if col in df.columns:
+            df[col] = df[col].apply(_parse_amount)
+
+    # 解析百分比
+    for col in ["pct_chg", "turnover_rate"]:
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.replace("%", "", regex=False)
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # 归一化代码为 6 位(THS 返回的 code 是 int 去前导零)
+    def _norm_code(c):
+        try:
+            return f"{int(c):06d}"
+        except (ValueError, TypeError):
+            return str(c).zfill(6)
+    df["code"] = df["code_raw"].apply(_norm_code)
+    df["price"] = pd.to_numeric(df["price"], errors="coerce")
+
+    keep = ["code", "name", "price", "pct_chg", "turnover_rate",
+            "inflow", "outflow", "net", "turnover"]
+    df = df[[c for c in keep if c in df.columns]]
+
+    # 缓存全市场表(4h TTL,与 capital_flow 同)
+    _cache_set("capital_flow", _THS_CACHE_KEY, df.to_dict(orient="records"))
+    return df
+
+
+def _parse_ths_realtime(code: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
+    """从 THS 全市场表中过滤目标股票,构建简化 result。"""
+    code = normalize_code(code)
+    row = df[df["code"] == code]
+    if row.empty:
+        return None
+
+    r = row.iloc[0]
+    net = float(r.get("net", 0) or 0)
+    turnover = float(r.get("turnover", 0) or 0)
+    inflow = float(r.get("inflow", 0) or 0)
+    outflow = float(r.get("outflow", 0) or 0)
+    price = float(r["price"]) if pd.notna(r.get("price")) else None
+    pct_chg = float(r["pct_chg"]) if pd.notna(r.get("pct_chg")) else None
+
+    main_pct = (net / turnover * 100) if turnover > 0 else 0.0
+
+    today = {
+        "date": datetime.now().strftime("%Y-%m-%d"),
+        "close": price,
+        "pct_chg": pct_chg,
+        "main_net_amount": round(net, 0),
+        "main_net_pct": round(main_pct, 2),
+        "inflow_amount": round(inflow, 0),
+        "outflow_amount": round(outflow, 0),
+        "turnover": round(turnover, 0),
+    }
+
+    # 简化信号:只用今日数据
+    if net > 0 and main_pct >= 10:
+        action, strength = "吸筹", "强"
+    elif net < 0 and main_pct <= -10:
+        action, strength = "派发", "强"
+    elif net > 0 and main_pct >= 5:
+        action, strength = "吸筹", "中"
+    elif net < 0 and main_pct <= -5:
+        action, strength = "派发", "中"
+    elif net > 0:
+        action, strength = "吸筹", "弱"
+    elif net < 0:
+        action, strength = "派发", "弱"
+    else:
+        action, strength = "中性", "弱"
+
+    evidence = [
+        f"今日主力净额 {net:,.0f} 元({main_pct:.2f}% of 成交额)",
+        f"流入 {inflow:,.0f} / 流出 {outflow:,.0f}",
+        f"成交额 {turnover:,.0f}",
+        "数据源:同花顺(东财反爬降级)",
+    ]
+    if action == "中性":
+        interpretation = "主力资金今日无明显方向(THS 即时数据)"
+    elif action == "吸筹":
+        interpretation = f"主力资金今日净流入 {net:,.0f} 元,占比 {main_pct:.2f}%"
+    else:
+        interpretation = f"主力资金今日净流出 {abs(net):,.0f} 元,占比 {abs(main_pct):.2f}%"
+
+    return {
+        "code": code,
+        "available": True,
+        "source": "ths",
+        "days_returned": 1,
+        "today": today,
+        "cumulative": {
+            "today": {
+                "available": True,
+                "main_net_amount": round(net, 0),
+                "main_pct": round(main_pct, 2),
+                "inflow_amount": round(inflow, 0),
+                "outflow_amount": round(outflow, 0),
+                "turnover": round(turnover, 0),
+            }
+        },
+        "trend": {
+            "available": False,
+            "reason": "THS 即时数据无日线序列,无法计算 MA/连续天数",
+        },
+        "signals": {
+            "main_force_action": action,
+            "strength": strength,
+            "evidence": evidence,
+            "interpretation": interpretation,
+        },
+    }
+
+
 # ---------- 主入口 ----------
 
 def fetch_capital_flow(code: str, days: int = 60) -> Dict[str, Any]:
@@ -301,6 +486,13 @@ def fetch_capital_flow(code: str, days: int = 60) -> Dict[str, Any]:
         klines = _fetch_raw(code)
         df = _parse_klines(klines)
     except Exception as e:
+        # 东财失败 -> THS fallback
+        ths_df = _fetch_ths_realtime_all()
+        if ths_df is not None and not ths_df.empty:
+            ths_result = _parse_ths_realtime(code, ths_df)
+            if ths_result is not None:
+                _cache_set("capital_flow", cache_key, ths_result)
+                return ths_result
         return {"code": code, "available": False, "error": f"资金流拉取失败: {e}"}
 
     if len(df) < 5:
