@@ -324,6 +324,38 @@ def _fetch_industry_fallback(code: str) -> str:
     return _INDUSTRY_FALLBACK.get(code, "")
 
 
+def fetch_industry_light(code: str) -> str:
+    """轻量拉取行业字段(不拉财务),用于 --no-fundamental 场景的 sector 判断。
+
+    优先用 stock_individual_info_em(轻量),失败则用硬编码兜底。
+    带 7 天缓存(行业不变)。
+    """
+    code = normalize_code(code)
+    cache_key = _cache_key("industry_light", code)
+    cached = _cache_get("industry_light", cache_key)
+    if cached is not None:
+        return cached
+
+    industry = ""
+    try:
+        def _fetch():
+            return ak.stock_individual_info_em(symbol=code)
+        individual = _retry_with_backoff(_fetch, max_retries=2, base_delay=1.0)
+        for _, row in individual.iterrows():
+            k = str(row["item"])
+            if "行业" in k:
+                industry = str(row["value"])
+                break
+    except Exception:
+        pass
+
+    if not industry:
+        industry = _fetch_industry_fallback(code)
+
+    _cache_set("industry_light", cache_key, industry)
+    return industry
+
+
 def fetch_daily(code: str, days: int = 120) -> pd.DataFrame:
     """拉前复权日线,返回最近 N 个交易日。
 

@@ -102,6 +102,26 @@ def analyze(code_or_name: str, days: int = 120, include_fundamental: bool = True
     except Exception:
         pass
 
+    # 行业分层模式分析(成长/周期/价值三模式动态阈值)
+    try:
+        from sector_mode import analyze_sector_mode
+        # --no-fundamental 时用轻量 industry 拉取兜底
+        fund_for_mode = fundamental if isinstance(fundamental, dict) and fundamental.get("industry") else None
+        if fund_for_mode is None:
+            try:
+                from fetch_data import fetch_industry_light
+                light_industry = fetch_industry_light(raw["code"])
+                if light_industry:
+                    fund_for_mode = {"industry": light_industry, "name": raw["name"]}
+            except Exception:
+                pass
+        indicators["sector_mode"] = analyze_sector_mode(
+            indicators=indicators,
+            fundamental=fund_for_mode,
+        )
+    except Exception:
+        pass
+
     # 拉取最近新闻(失败不阻塞主流程)
     try:
         from fetch_news import fetch_news

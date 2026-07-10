@@ -27,6 +27,11 @@ from fundamental import (
 from fetch_news import (
     _classify_sentiment, _compute_sentiment_summary, _extract_key_events,
 )
+from sector_mode import (
+    classify_mode_by_sector, classify_sector_by_industry,
+    get_position_threshold, analyze_sector_mode,
+    SECTOR_MODE, POSITION_THRESHOLD,
+)
 import pandas as pd
 
 
@@ -2470,6 +2475,192 @@ def test_news_key_events_extraction():
     print(f"✅ test_news_key_events_extraction passed (events={events})")
 
 
+# ===================== 行业分层模式(sector_mode)测试 =====================
+
+def test_classify_mode_by_sector_growth():
+    """成长行业映射正确。"""
+    assert classify_mode_by_sector('AI服务器') == 'growth'
+    assert classify_mode_by_sector('AI芯片') == 'growth'
+    assert classify_mode_by_sector('半导体') == 'growth'
+    assert classify_mode_by_sector('创新药') == 'growth'
+    assert classify_mode_by_sector('新能源车') == 'growth'
+    assert classify_mode_by_sector('军工') == 'growth'
+    print("✅ test_classify_mode_by_sector_growth passed")
+
+
+def test_classify_mode_by_sector_cyclical():
+    """周期行业映射正确。"""
+    assert classify_mode_by_sector('煤炭') == 'cyclical'
+    assert classify_mode_by_sector('黄金') == 'cyclical'
+    assert classify_mode_by_sector('化工') == 'cyclical'
+    assert classify_mode_by_sector('猪肉') == 'cyclical'
+    print("✅ test_classify_mode_by_sector_cyclical passed")
+
+
+def test_classify_mode_by_sector_value():
+    """价值行业映射正确。"""
+    assert classify_mode_by_sector('银行') == 'value'
+    assert classify_mode_by_sector('白酒') == 'value'
+    assert classify_mode_by_sector('家电') == 'value'
+    assert classify_mode_by_sector('红利') == 'value'
+    print("✅ test_classify_mode_by_sector_value passed")
+
+
+def test_classify_mode_by_sector_unknown():
+    """未分类行业返回unknown。"""
+    assert classify_mode_by_sector('某某行业') == 'unknown'
+    assert classify_mode_by_sector('') == 'unknown'
+    print("✅ test_classify_mode_by_sector_unknown passed")
+
+
+def test_classify_sector_by_industry():
+    """industry字段推断sector。"""
+    assert classify_sector_by_industry('食品饮料(白酒)') == '白酒'
+    assert classify_sector_by_industry('半导体') == '半导体'
+    assert classify_sector_by_industry('煤炭开采') == '煤炭'
+    assert classify_sector_by_industry('有色金属') == '有色'
+    # 名称兜底
+    assert classify_sector_by_industry('', '五粮液') == '白酒'
+    assert classify_sector_by_industry(None, '某某') == ''
+    print("✅ test_classify_sector_by_industry passed")
+
+
+def test_position_threshold_by_mode():
+    """各模式位置阈值正确。"""
+    assert get_position_threshold('growth') == 60
+    assert get_position_threshold('cyclical') == 30
+    assert get_position_threshold('value') == 40
+    assert get_position_threshold('unknown') == 30  # 默认
+    print("✅ test_position_threshold_by_mode passed")
+
+
+def test_analyze_sector_mode_growth_buy_point():
+    """成长模式买点判定(低位+量比+金叉+吸筹)。"""
+    indicators = {
+        'position': {'pct_120d': 25},  # <60%
+        'five_step': {
+            '3_vol_ratio': {'pass': True},
+            '4_vol_ma_cross': {'pass': True},
+            '5_breakout_3day': {'pass': False},  # growth不要求突破
+        },
+        'capital_flow': {'available': True, 'signals': {'main_force_action': '吸筹'}},
+        'chip_cross_validation': {'main_force_intent': '强吸筹'},
+    }
+    r = analyze_sector_mode(indicators, sector='AI芯片')
+    assert r['mode'] == 'growth'
+    assert r['position_pass'] is True
+    assert r['signal_pass'] is True  # 量比+金叉
+    assert r['capital_flow_pass'] is True
+    assert r['is_buy_point'] is True
+    assert r['funnel_count'] == 4
+    assert r['bottom_signal'] is True  # 低位+量比+金叉+吸筹
+    assert r['breakout_signal'] is False  # 位置<50%
+    print("✅ test_analyze_sector_mode_growth_buy_point passed")
+
+
+def test_analyze_sector_mode_growth_breakout_signal():
+    """成长模式主升浪信号(高位+量比+金叉+吸筹)。"""
+    indicators = {
+        'position': {'pct_120d': 55},  # >50%触发主升浪,<60%通过位置
+        'five_step': {
+            '3_vol_ratio': {'pass': True},
+            '4_vol_ma_cross': {'pass': True},
+            '5_breakout_3day': {'pass': False},
+        },
+        'capital_flow': {'available': False},
+        'chip_cross_validation': {'main_force_intent': '强吸筹'},
+    }
+    r = analyze_sector_mode(indicators, sector='半导体')
+    assert r['mode'] == 'growth'
+    assert r['breakout_signal'] is True  # 高位>50%+量比+金叉+吸筹
+    assert r['bottom_signal'] is False
+    assert r['is_buy_point'] is True  # 4/4全过
+    print("✅ test_analyze_sector_mode_growth_breakout_signal passed")
+
+
+def test_analyze_sector_mode_cyclical_needs_breakout():
+    """周期模式要求突破(量比+金叉+突破)。"""
+    indicators = {
+        'position': {'pct_120d': 20},  # <30%
+        'five_step': {
+            '3_vol_ratio': {'pass': True},
+            '4_vol_ma_cross': {'pass': True},
+            '5_breakout_3day': {'pass': False},  # 缺突破
+        },
+        'capital_flow': {'available': True, 'signals': {'main_force_action': '吸筹'}},
+        'chip_cross_validation': {'main_force_intent': '吸筹'},
+    }
+    r = analyze_sector_mode(indicators, sector='煤炭')
+    assert r['mode'] == 'cyclical'
+    assert r['position_pass'] is True
+    assert r['signal_pass'] is False  # 缺突破
+    assert r['is_buy_point'] is False
+    assert r['funnel_count'] == 3  # 差突破这一步
+    print("✅ test_analyze_sector_mode_cyclical_needs_breakout passed")
+
+
+def test_analyze_sector_mode_warn_signal():
+    """高位减仓信号(高位+派发)。"""
+    indicators = {
+        'position': {'pct_120d': 85},  # >70%
+        'five_step': {
+            '3_vol_ratio': {'pass': True},
+            '4_vol_ma_cross': {'pass': True},
+            '5_breakout_3day': {'pass': True},
+        },
+        'capital_flow': {'available': False},
+        'chip_cross_validation': {'main_force_intent': '派发'},
+    }
+    r = analyze_sector_mode(indicators, sector='AI芯片')
+    assert r['mode'] == 'growth'
+    assert r['warn_signal'] is True  # 高位+派发
+    assert r['capital_flow_pass'] is False  # 派发不算吸筹
+    assert r['is_buy_point'] is False
+    print("✅ test_analyze_sector_mode_warn_signal passed")
+
+
+def test_analyze_sector_mode_growth_relaxed_position():
+    """成长模式位置放宽:120日47%通过(旧版<30%会卡掉)。"""
+    indicators = {
+        'position': {'pct_120d': 47},  # 30<47<60
+        'five_step': {
+            '3_vol_ratio': {'pass': True},
+            '4_vol_ma_cross': {'pass': True},
+            '5_breakout_3day': {'pass': False},
+        },
+        'capital_flow': {'available': False},
+        'chip_cross_validation': {'main_force_intent': '强吸筹'},
+    }
+    r = analyze_sector_mode(indicators, sector='AI芯片')
+    assert r['mode'] == 'growth'
+    assert r['position_pass'] is True  # growth<60%通过
+    assert r['is_buy_point'] is True
+    # 同样位置,周期模式会卡掉
+    r2 = analyze_sector_mode(indicators, sector='煤炭')
+    assert r2['mode'] == 'cyclical'
+    assert r2['position_pass'] is False  # cyclical<30%卡掉
+    print("✅ test_analyze_sector_mode_growth_relaxed_position passed")
+
+
+def test_analyze_sector_mode_unknown_sector():
+    """未分类sector降级为unknown,用默认阈值30%。"""
+    indicators = {
+        'position': {'pct_120d': 25},
+        'five_step': {
+            '3_vol_ratio': {'pass': True},
+            '4_vol_ma_cross': {'pass': True},
+            '5_breakout_3day': {'pass': True},
+        },
+        'capital_flow': {'available': True, 'signals': {'main_force_action': '吸筹'}},
+        'chip_cross_validation': {'main_force_intent': ''},
+    }
+    r = analyze_sector_mode(indicators, sector='某某新行业')
+    assert r['mode'] == 'unknown'
+    assert r['funnel_count'] == 3  # step1=False(未分类)
+    assert r['is_buy_point'] is False
+    print("✅ test_analyze_sector_mode_unknown_sector passed")
+
+
 if __name__ == "__main__":
     test_position_percentile()
     test_position_label()
@@ -2637,4 +2828,17 @@ if __name__ == "__main__":
     test_news_sentiment_summary_dominant()
     test_news_sentiment_summary_divergence()
     test_news_key_events_extraction()
+    # 行业分层模式
+    test_classify_mode_by_sector_growth()
+    test_classify_mode_by_sector_cyclical()
+    test_classify_mode_by_sector_value()
+    test_classify_mode_by_sector_unknown()
+    test_classify_sector_by_industry()
+    test_position_threshold_by_mode()
+    test_analyze_sector_mode_growth_buy_point()
+    test_analyze_sector_mode_growth_breakout_signal()
+    test_analyze_sector_mode_cyclical_needs_breakout()
+    test_analyze_sector_mode_warn_signal()
+    test_analyze_sector_mode_growth_relaxed_position()
+    test_analyze_sector_mode_unknown_sector()
     print("\n🎉 All tests passed!")
