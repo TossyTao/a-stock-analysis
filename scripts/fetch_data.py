@@ -143,6 +143,7 @@ _CACHE_TTL = {
     "capital_flow": timedelta(hours=4),    # 主力资金流:4 小时(盘中+盘后)
     "news": timedelta(hours=4),            # 新闻舆情:4 小时(盘中可能更新)
     "intraday": timedelta(days=1),         # 日内分时数据:1 天(历史数据不变)
+    "market_timing": timedelta(days=1),    # 市场择时:1 天(日频数据)
 }
 
 

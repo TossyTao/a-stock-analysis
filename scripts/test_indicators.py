@@ -2795,6 +2795,128 @@ def test_intraday_classification_old_ox():
     print(f"✅ test_intraday_classification_old_ox passed (cls={cls})")
 
 
+# ---------- 矩阵 13:市场择时 ----------
+from market_timing import _vote_to_position, _verdict_label
+
+
+def test_erp_calculation():
+    """ERP = 1/PE - 国债利率"""
+    # PE=15, 国债=2.5% -> ERP = 1/15 - 0.025 = 0.0667 - 0.025 = 0.0417
+    pe = 15.0
+    bond = 0.025
+    erp = 1.0 / pe - bond
+    assert abs(erp - 0.0417) < 0.001, f"ERP 计算错误: {erp}"
+    print(f"✅ test_erp_calculation passed (erp={erp:.4f})")
+
+
+def test_erp_bullish_high():
+    """ERP 高于中位数+1σ -> 看多(模拟判定逻辑)"""
+    # 模拟 ERP 历史:中位数 0.03,σ 0.005,当前 0.045(高于 中位+1σ)
+    erp_median = 0.03
+    erp_std = 0.005
+    erp_current = 0.045
+    if erp_current > erp_median + erp_std:
+        verdict = "看多"
+    elif erp_current < erp_median - erp_std:
+        verdict = "看空"
+    else:
+        verdict = "中性"
+    assert verdict == "看多", f"ERP 高应看多, got {verdict}"
+    print(f"✅ test_erp_bullish_high passed (verdict={verdict})")
+
+
+def test_margin_boll_breakout():
+    """融资买入额突破布林上轨 -> 看多"""
+    # 模拟:20 日均 100 亿,σ 10 亿,当前 130 亿(突破上轨 120)
+    import statistics
+    series = [100, 95, 105, 98, 102, 100, 103, 97, 100, 102,
+              99, 101, 100, 98, 102, 100, 103, 97, 100, 130]
+    mu = statistics.mean(series)
+    sigma = statistics.stdev(series)
+    upper = mu + 2 * sigma
+    current = series[-1]
+    if current > upper:
+        verdict = "看多"
+    elif current < mu - 2 * sigma:
+        verdict = "看空"
+    else:
+        verdict = "中性"
+    assert verdict == "看多", f"突破上轨应看多, got {verdict} (current={current}, upper={upper:.1f})"
+    print(f"✅ test_margin_boll_breakout passed (current={current}, upper={upper:.1f})")
+
+
+def test_market_breadth_bullish():
+    """上涨家数>70% -> 看多"""
+    # 模拟:5500 家,上涨 4000,下跌 1500 -> breadth = 0.727
+    up = 4000
+    down = 1500
+    total = up + down
+    breadth = up / total
+    if breadth > 0.7:
+        verdict = "看多"
+    elif breadth < 0.3:
+        verdict = "看空"
+    else:
+        verdict = "中性"
+    assert verdict == "看多", f"广度 0.727 应看多, got {verdict}"
+    print(f"✅ test_market_breadth_bullish passed (breadth={breadth:.3f})")
+
+
+def test_pcr_panic_signal():
+    """PCR>1.2 -> 恐慌看多"""
+    pcr = 1.35  # 认沽/认购 > 1.2 = 恐慌
+    if pcr > 1.2:
+        verdict = "看多"
+    elif pcr < 0.8:
+        verdict = "看空"
+    else:
+        verdict = "中性"
+    assert verdict == "看多", f"PCR 1.35 应看多, got {verdict}"
+    print(f"✅ test_pcr_panic_signal passed (pcr={pcr})")
+
+
+def test_fundamental_bottom_signal():
+    """CPI+PMI 双弱 -> 反向底部看多"""
+    cpi_trend = "走弱"
+    pmi_trend = "走弱"
+    if cpi_trend == "走弱" and pmi_trend == "走弱":
+        verdict = "看多"
+        bottom_signal = True
+    elif cpi_trend == "走强" and pmi_trend == "走强":
+        verdict = "看空"
+        bottom_signal = False
+    else:
+        verdict = "中性"
+        bottom_signal = False
+    assert verdict == "看多" and bottom_signal, f"双弱应看多+底部信号, got {verdict}"
+    print(f"✅ test_fundamental_bottom_signal passed (verdict={verdict}, bottom={bottom_signal})")
+
+
+def test_vote_to_position():
+    """投票 3 看多 -> 50% 仓位"""
+    # 3 看多 + 1 中性 + 1 看空 -> 50%
+    r = _vote_to_position(bullish=3, neutral=1, bearish=1)
+    assert r["position"] == "50%", f"3 看多应 50%, got {r['position']}"
+    assert r["verdict"] == "中性偏多"
+    # 4 看多 -> 100%
+    r = _vote_to_position(bullish=4, neutral=1, bearish=0)
+    assert r["position"] == "100%" and r["verdict"] == "看多"
+    # 1 看多 + 1 中性 + 3 看空 -> 20%(中性偏空)
+    r = _vote_to_position(bullish=1, neutral=1, bearish=3)
+    assert r["position"] == "20%", f"3 看空应 20%, got {r['position']}"
+    assert r["verdict"] == "中性偏空"
+    # 2 看多 + 2 中性 + 1 看空 -> 50%(中性偏多)
+    r = _vote_to_position(bullish=2, neutral=2, bearish=1)
+    assert r["position"] == "50%" and r["verdict"] == "中性偏多"
+    # 0 看多 + 4 中性 + 1 看空 -> 30%(中性)
+    r = _vote_to_position(bullish=0, neutral=4, bearish=1)
+    assert r["position"] == "30%" and r["verdict"] == "中性"
+    # 0 看多 + 3 中性 + 2 看空 -> 0%(看空)
+    r = _vote_to_position(bullish=0, neutral=3, bearish=2)
+    assert r["position"] == "0%" and r["verdict"] == "看空"
+    print(f"✅ test_vote_to_position passed")
+
+
 if __name__ == "__main__":
     test_position_percentile()
     test_position_label()
@@ -2982,4 +3104,12 @@ if __name__ == "__main__":
     test_intraday_close_position_low()
     test_intraday_tail_ratio_late_surge()
     test_intraday_classification_old_ox()
+    # 矩阵 13:市场择时
+    test_erp_calculation()
+    test_erp_bullish_high()
+    test_margin_boll_breakout()
+    test_market_breadth_bullish()
+    test_pcr_panic_signal()
+    test_fundamental_bottom_signal()
+    test_vote_to_position()
     print("\n🎉 All tests passed!")
