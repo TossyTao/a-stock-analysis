@@ -122,6 +122,23 @@ def analyze(code_or_name: str, days: int = 120, include_fundamental: bool = True
     except Exception:
         pass
 
+    # 日内走势诊断(矩阵 14)
+    try:
+        from intraday_analysis import analyze_intraday
+        # 20 日均成交量(股),用于装忙型识别
+        daily_records = raw["daily"] if isinstance(raw["daily"], list) else []
+        avg_20 = None
+        if len(daily_records) >= 20:
+            recent_vols = [d.get("volume", 0) for d in daily_records[-20:]]
+            avg_20 = sum(recent_vols) / 20.0 if recent_vols else None
+        indicators["intraday"] = analyze_intraday(
+            code=raw["code"],
+            daily_volume_20avg=avg_20,
+            free_float_shares=free_float_shares,
+        )
+    except Exception as e:
+        indicators["intraday"] = {"available": False, "error": str(e)}
+
     # 拉取最近新闻(失败不阻塞主流程)
     try:
         from fetch_news import fetch_news

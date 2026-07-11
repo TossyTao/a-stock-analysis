@@ -881,7 +881,7 @@ python3 analyze.py 000001 --no-fundamental  # 跳过基本面(网络差时)
 - **矩阵 1(量价四象限):** 矩阵 1 看日 K(开盘/收盘/量),矩阵 14 看日内分时(路径/收盘位置/量价转化/尾盘)。两者互补
 - **矩阵 5(主力骗局):** "尾盘突击型" = 矩阵 5 的"算法无量空涨"的日内版本,警惕诱多
 - **矩阵 11 反指:** "装忙型"(成交大涨幅小)可能是主力派发前兆,与"主力净流入反指"对应
-- **数据获取:** akshare 有 `stock_zh_a_minute` 分时数据,可计算路径效率/收盘位置/尾盘占比。当前脚本未提供,需手动核查或后续代码化
+- **数据获取:** ✅ 已代码化。`analyze.py` 自动计算,从 `indicators.intraday` 读取。独立 CLI:`python3 intraday_analysis.py 600879`
 
 ### 14.4 核心原则
 
@@ -923,6 +923,10 @@ python3 analyze.py 000001 --no-fundamental  # 跳过基本面(网络差时)
 量价细化:{volume_price_detail.primary_signal} - [若 signals 非空,列第 1 条 interpretation]
 信号解读:[从矩阵 1 + 1.1 + 1.5 查表]
 拐点验证:[单日与 5 日是否一致,不一致则提示拐点]
+
+### 2.1 日内走势诊断(矩阵 14,自动)
+类型:{intraday.classification} / 路径效率 {metrics.path_efficiency} / 收盘位置 {metrics.close_position} / 尾盘占比 {metrics.tail_ratio} / 振幅 {metrics.amplitude}%
+解读:{intraday.interpretation} -> {intraday.action_hint}
 
 ## 三、筹码峰分析(换手率衰减 + 底仓追踪)
 衰减模式:{chip.decay_meta.decay_mode}(avg_turnover {avg_turnover}) / 流通股本 {free_float_shares}

@@ -2661,6 +2661,140 @@ def test_analyze_sector_mode_unknown_sector():
     print("✅ test_analyze_sector_mode_unknown_sector passed")
 
 
+# ---------- 矩阵 14:日内走势诊断 ----------
+from intraday_analysis import _compute_metrics, _classify
+
+
+def _make_minutes(open_price: float, close_price: float, high: float, low: float,
+                  pct_chg: float = None, total_vol: float = 1_000_000,
+                  tail_baseline: float = None, n: int = 240) -> list:
+    """造分钟数据:用 open/close/high/low 简单合成 n 根 K 线。
+
+    tail_baseline:14:30 价格(用于尾盘占比测试)。None 时按线性插值。
+    时间序列:09:31-11:30 + 13:01-15:00(共 240 分钟)。
+    """
+    if pct_chg is None:
+        pct_chg = (close_price - open_price) / open_price * 100 if open_price > 0 else 0.0
+    # A 股交易时间:9:30-11:30 + 13:00-15:00,共 240 分钟
+    times = []
+    for h, m in [(9, 31 + i) for i in range(120)]:
+        hh = 9 + (30 + 1 + (m - 31)) // 60 if False else h
+        # 简化:直接生成 09:31-11:30 共 120 分钟
+        pass
+    # 直接构造 09:31-11:30(120 根)+ 13:01-15:00(120 根)= 240 根
+    time_strs = []
+    for i in range(120):  # 09:31 - 11:30
+        hh = 9 + (31 + i) // 60
+        mm = (31 + i) % 60
+        time_strs.append(f"2026-07-11 {hh:02d}:{mm:02d}")
+    for i in range(120):  # 13:01 - 15:00
+        hh = 13 + (1 + i) // 60
+        mm = (1 + i) % 60
+        time_strs.append(f"2026-07-11 {hh:02d}:{mm:02d}")
+    time_strs = time_strs[:n]
+
+    minutes = []
+    for i, ts in enumerate(time_strs):
+        ratio = i / (n - 1) if n > 1 else 0
+        price = open_price + (close_price - open_price) * ratio
+        minutes.append({
+            "time": ts,
+            "open": price,
+            "high": price + 0.01,
+            "low": price - 0.01,
+            "close": price,
+            "volume": total_vol / n,
+            "amount": total_vol / n * price,
+        })
+    minutes[0]["open"] = open_price
+    minutes[-1]["close"] = close_price
+    for m in minutes:
+        m["high"] = max(m["high"], high)
+        m["low"] = min(m["low"], low)
+    # 尾盘基准价:14:30 之前的最后一根 close
+    if tail_baseline is not None:
+        for m in minutes:
+            hhmm = m["time"][11:16]
+            if hhmm <= "14:30":
+                m["close"] = tail_baseline
+    return minutes
+
+
+def test_intraday_path_efficiency_smooth():
+    """平滑上涨:路径效率 > 0.7"""
+    # open=10, close=11, high=11.05, low=9.95 -> 路径效率 = 1/1.1 ≈ 0.91
+    minutes = _make_minutes(open_price=10.0, close_price=11.0, high=11.05, low=9.95)
+    r = _compute_metrics(minutes)
+    assert r["available"], f"应可用: {r}"
+    assert r["metrics"]["path_efficiency"] > 0.7, f"路径效率应>0.7, got {r['metrics']['path_efficiency']}"
+    print(f"✅ test_intraday_path_efficiency_smooth passed (pe={r['metrics']['path_efficiency']})")
+
+
+def test_intraday_path_efficiency_volatile():
+    """震荡:收盘接近开盘,路径效率 < 0.3"""
+    # open=10, close=10.1, 但 high=11, low=9 -> 路径效率 = 0.1/2 = 0.05
+    minutes = _make_minutes(open_price=10.0, close_price=10.1, high=11.0, low=9.0)
+    r = _compute_metrics(minutes)
+    assert r["available"], f"应可用: {r}"
+    assert r["metrics"]["path_efficiency"] < 0.3, f"路径效率应<0.3, got {r['metrics']['path_efficiency']}"
+    print(f"✅ test_intraday_path_efficiency_volatile passed (pe={r['metrics']['path_efficiency']})")
+
+
+def test_intraday_close_position_high():
+    """收盘接近高点:close_position > 0.8"""
+    # open=10, close=11, high=11.05, low=9.95 -> close_position = (11-9.95)/(11.05-9.95) ≈ 0.95
+    minutes = _make_minutes(open_price=10.0, close_price=11.0, high=11.05, low=9.95)
+    r = _compute_metrics(minutes)
+    assert r["available"], f"应可用: {r}"
+    assert r["metrics"]["close_position"] > 0.8, f"收盘位置应>0.8, got {r['metrics']['close_position']}"
+    print(f"✅ test_intraday_close_position_high passed (cp={r['metrics']['close_position']})")
+
+
+def test_intraday_close_position_low():
+    """收盘接近低点:close_position < 0.5"""
+    # open=11, close=9.95, high=11.05, low=9.9 -> close_position = (9.95-9.9)/(11.05-9.9) ≈ 0.04
+    minutes = _make_minutes(open_price=11.0, close_price=9.95, high=11.05, low=9.9)
+    r = _compute_metrics(minutes)
+    assert r["available"], f"应可用: {r}"
+    assert r["metrics"]["close_position"] < 0.5, f"收盘位置应<0.5, got {r['metrics']['close_position']}"
+    print(f"✅ test_intraday_close_position_low passed (cp={r['metrics']['close_position']})")
+
+
+def test_intraday_tail_ratio_late_surge():
+    """尾盘突击型:14:30 价格接近开盘,尾盘拉升 -> tail_ratio > 0.5"""
+    # 全天: open=10, 14:30 价格=10.05, close=10.5
+    # tail_gain = 10.5 - 10.05 = 0.45, full_gain = 10.5 - 10 = 0.5
+    # tail_ratio = 0.45/0.5 = 0.9 > 0.5
+    minutes = _make_minutes(
+        open_price=10.0, close_price=10.5, high=10.6, low=9.95,
+        tail_baseline=10.05,
+    )
+    r = _compute_metrics(minutes)
+    assert r["available"], f"应可用: {r}"
+    assert r["metrics"]["tail_ratio"] > 0.5, f"尾盘占比应>0.5, got {r['metrics']['tail_ratio']}"
+    # 分类应为尾盘突击型
+    cls, _, action = _classify(r)
+    assert cls == "尾盘突击型", f"应分类为尾盘突击型, got {cls}"
+    print(f"✅ test_intraday_tail_ratio_late_surge passed (tr={r['metrics']['tail_ratio']}, cls={cls})")
+
+
+def test_intraday_classification_old_ox():
+    """老黄牛型:路径效率>0.7 + 收盘位置>0.8 + 尾盘占比<30%"""
+    # 平滑上涨 + 收盘近高点 + 尾盘不突击
+    # open=10, 14:30 价格=10.7, close=11 -> tail_gain=0.3, full_gain=1, tail_ratio=0.3
+    # 需 tail_ratio < 0.3,改成 14:30 价格=10.85, close=11 -> 0.15/1=0.15
+    minutes = _make_minutes(
+        open_price=10.0, close_price=11.0, high=11.05, low=9.95,
+        tail_baseline=10.85,
+    )
+    r = _compute_metrics(minutes)
+    assert r["available"], f"应可用: {r}"
+    cls, interp, action = _classify(r)
+    assert cls == "老黄牛型", f"应分类为老黄牛型, got {cls} (pe={r['metrics']['path_efficiency']}, cp={r['metrics']['close_position']}, tr={r['metrics']['tail_ratio']})"
+    assert "跟随" in action
+    print(f"✅ test_intraday_classification_old_ox passed (cls={cls})")
+
+
 if __name__ == "__main__":
     test_position_percentile()
     test_position_label()
@@ -2841,4 +2975,11 @@ if __name__ == "__main__":
     test_analyze_sector_mode_warn_signal()
     test_analyze_sector_mode_growth_relaxed_position()
     test_analyze_sector_mode_unknown_sector()
+    # 矩阵 14:日内走势诊断
+    test_intraday_path_efficiency_smooth()
+    test_intraday_path_efficiency_volatile()
+    test_intraday_close_position_high()
+    test_intraday_close_position_low()
+    test_intraday_tail_ratio_late_surge()
+    test_intraday_classification_old_ox()
     print("\n🎉 All tests passed!")
